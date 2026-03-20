@@ -475,6 +475,20 @@ const authMiddleware = async (req, res, next) => {
     });
 };
 
+// ==========================================
+// PING ENDPOINT FOR CRON-JOB.ORG
+// ==========================================
+app.get('/api/ping', async (req, res) => {
+    await connectDB(); // Keep MongoDB connection warm
+    res.status(200).json({ 
+        success: true, 
+        message: 'Bot is awake', 
+        timestamp: new Date().toISOString(),
+        activeProfiles: activeBots.size
+    });
+});
+// ==========================================
+
 app.post('/api/register', async (req, res) => {
     await connectDB();
     try {
@@ -585,7 +599,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>HTX Multi-User Bot</title>
+        <title>HTX Multi-User Bot (Vercel Build)</title>
         <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
             body { font-family: 'Roboto', sans-serif; background: #f4f6f8; color: #333; margin: 0; padding: 20px; }
