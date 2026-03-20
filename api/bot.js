@@ -84,6 +84,7 @@ const OffsetRecord = mongoose.model('OffsetRecord', OffsetRecordSchema);
 // ==========================================
 const activeBots = new Map();
 const globalPnlPeaks = new Map(); 
+const lastStopLossExecutions = new Map(); // Tracks last Stop Loss timestamp to enforce 1 per min rule
 
 function logForProfile(profileId, msg) {
     console.log(`[Profile: ${profileId}] ${msg}`);
@@ -331,8 +332,12 @@ setInterval(async () => {
                         triggerOffset = true;
                         reason = 'TAKE PROFIT';
                     } else if (smartOffsetStopLoss < 0 && netResult <= smartOffsetStopLoss) {
-                        triggerOffset = true;
-                        reason = 'STOP LOSS';
+                        // Rate Limiter: Maximum 1 Stop Loss per minute across V1 and V2
+                        if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
+                            triggerOffset = true;
+                            reason = 'STOP LOSS';
+                            lastStopLossExecutions.set(dbUserId, Date.now());
+                        }
                     }
                     
                     if (triggerOffset) {
@@ -388,8 +393,12 @@ setInterval(async () => {
                         triggerOffset = true;
                         reason = 'TAKE PROFIT (V2)';
                     } else if (smartOffsetStopLoss2 < 0 && netResult <= smartOffsetStopLoss2) {
-                        triggerOffset = true;
-                        reason = 'STOP LOSS (V2)';
+                        // Rate Limiter: Maximum 1 Stop Loss per minute across V1 and V2
+                        if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
+                            triggerOffset = true;
+                            reason = 'STOP LOSS (V2)';
+                            lastStopLossExecutions.set(dbUserId, Date.now());
+                        }
                     }
                     
                     if (triggerOffset) {
