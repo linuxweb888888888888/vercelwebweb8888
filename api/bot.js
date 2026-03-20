@@ -66,15 +66,6 @@ const SettingsSchema = new mongoose.Schema({
 });
 const Settings = mongoose.model('Settings', SettingsSchema);
 
-const IdleRecordSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    profileName: { type: String, required: true },
-    symbol: { type: String, required: true },
-    time: { type: String, required: true },
-    timestamp: { type: Date, default: Date.now }
-});
-const IdleRecord = mongoose.model('IdleRecord', IdleRecordSchema);
-
 const OffsetRecordSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     winnerSymbol: { type: String, required: true },
@@ -162,7 +153,7 @@ function startBot(userId, subAccount) {
             for (let coin of activeCoins) {
                 try {
                     if (!state.coinStates[coin.symbol]) {
-                        state.coinStates[coin.symbol] = { status: 'Running', currentPrice: 0, avgEntry: 0, contracts: 0, currentRoi: 0, unrealizedPnl: 0, margin: 0, lastDcaTime: 0, zeroRoiStartTime: Date.now() };
+                        state.coinStates[coin.symbol] = { status: 'Running', currentPrice: 0, avgEntry: 0, contracts: 0, currentRoi: 0, unrealizedPnl: 0, margin: 0, lastDcaTime: 0 };
                     }
 
                     let cState = state.coinStates[coin.symbol];
@@ -179,7 +170,6 @@ function startBot(userId, subAccount) {
                     // OPEN BASE POSITION
                     if (!position) {
                         cState.avgEntry = 0; cState.contracts = 0; cState.currentRoi = 0; cState.unrealizedPnl = 0; cState.margin = 0;
-                        cState.zeroRoiStartTime = Date.now();
                         const safeBaseQty = Math.max(1, Math.floor(currentSettings.baseQty));
                         
                         logForProfile(profileId, `[${coin.symbol}] 🛒 No position. Opening base position of ${safeBaseQty} contracts (${activeSide}).`);
@@ -203,39 +193,6 @@ function startBot(userId, subAccount) {
                     cState.unrealizedPnl = unrealizedPnl;
                     cState.margin = margin;
                     cState.currentRoi = margin > 0 ? (unrealizedPnl / margin) * 100 : 0;
-
-                    // IDLE COIN DETECTION (FIXED)
-                    if (cState.contracts > 0 && cState.currentRoi === 0) {
-                        if (!cState.zeroRoiStartTime) cState.zeroRoiStartTime = Date.now();
-                        if (Date.now() - cState.zeroRoiStartTime > 120000) {
-                            logForProfile(profileId, `[${coin.symbol}] 💤 Idle too long! Attempting to close position.`);
-                            const orderSide = activeSide === 'long' ? 'sell' : 'buy';
-                            
-                            try {
-                                await exchange.createOrder(coin.symbol, 'market', orderSide, cState.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: currentSettings.leverage });
-                                
-                                // ONLY mark as stopped if the order succeeds
-                                IdleRecord.create({ userId, profileName: currentSettings.name, symbol: coin.symbol, time: new Date().toLocaleTimeString() }).catch(()=>{});
-                                
-                                coin.botActive = false;
-                                cState.status = 'Stopped';
-                                cState.contracts = 0;
-
-                                Settings.updateOne(
-                                    { "subAccounts._id": currentSettings._id },
-                                    { $set: { "subAccounts.$[sub].coins.$[coin].botActive": false } },
-                                    { arrayFilters: [{ "sub._id": currentSettings._id }, { "coin.symbol": coin.symbol }] }
-                                ).catch(()=>{});
-                            } catch (closeErr) {
-                                logForProfile(profileId, `[${coin.symbol}] ❌ Failed to close idle position: ${closeErr.message}. Will retry.`);
-                                // Reset timer slightly so it doesn't spam the API, but tries again soon
-                                cState.zeroRoiStartTime = Date.now() - 110000; 
-                            }
-                            continue; 
-                        }
-                    } else {
-                        cState.zeroRoiStartTime = Date.now();
-                    }
 
                     // STANDARD SINGLE-COIN TP / SL
                     const isTakeProfit = cState.currentRoi >= currentSettings.takeProfitPct;
@@ -576,97 +533,13 @@ app.get('/api/status', authMiddleware, async (req, res) => {
     for (let [profileId, botData] of activeBots.entries()) {
         if (botData.userId === req.userId.toString()) userStatuses[profileId] = botData.state;
     }
-    
-    const dbIdleRecords = await IdleRecord.find({ userId: req.userId }).sort({ timestamp: -1 }).limit(100);
 
-    res.json({ states: userStatuses, subAccounts: settings ? settings.subAccounts : [], idleRecords: dbIdleRecords, globalSettings: settings });
+    res.json({ states: userStatuses, subAccounts: settings ? settings.subAccounts : [], globalSettings: settings });
 });
 
 app.get('/api/offsets', authMiddleware, async (req, res) => {
     const records = await OffsetRecord.find({ userId: req.userId }).sort({ timestamp: -1 }).limit(100);
     res.json(records);
-});
-
-// BULLETPROOF FORCE CLOSE ENDPOINT
-app.post('/api/idle/force-close', authMiddleware, async (req, res) => {
-    try {
-        // 1. Get all unique symbols from the user's Idle records
-        const idleRecords = await IdleRecord.find({ userId: req.userId });
-        const idleSymbols = [...new Set(idleRecords.map(r => r.symbol))];
-
-        if (idleSymbols.length === 0) {
-            return res.json({ success: true, message: 'No idle coins found in history.' });
-        }
-
-        const settings = await Settings.findOne({ userId: req.userId });
-        if (!settings) return res.status(404).json({ error: 'Settings not found' });
-
-        let closedCount = 0;
-
-        for (let sub of settings.subAccounts) {
-            if (!sub.apiKey || !sub.secret) continue;
-
-            const profileId = sub._id.toString();
-            const botData = activeBots.get(profileId); // Get live memory
-
-            const exchange = new ccxt.htx({ 
-                apiKey: sub.apiKey, 
-                secret: sub.secret, 
-                options: { defaultType: 'swap' }
-            });
-
-            // 2. FETCH ALL POSITIONS (Bypasses CCXT HTX bug)
-            const allPositions = await exchange.fetchPositions().catch(() => []);
-            
-            // Filter to only positions that are in the idle list AND currently open
-            const stuckPositions = allPositions.filter(p => idleSymbols.includes(p.symbol) && p.contracts > 0);
-            
-            for (let pos of stuckPositions) {
-                try {
-                    console.log(`[Profile: ${sub.name}] 🚨 Force Closing Idle Position: ${pos.symbol}`);
-                    const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                    
-                    await exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { 
-                        offset: 'close', 
-                        reduceOnly: true, 
-                        lever_rate: sub.leverage 
-                    });
-                    
-                    closedCount++;
-                } catch (err) {
-                    console.error(`❌ Force close failed for ${pos.symbol}:`, err.message);
-                }
-            }
-
-            // 3. FORCE KILL IN DATABASE & LIVE MEMORY
-            for (let coin of sub.coins) {
-                if (idleSymbols.includes(coin.symbol)) {
-                    // Turn off in Database
-                    coin.botActive = false; 
-                    
-                    // Turn off in LIVE MEMORY so it doesn't resurrect
-                    if (botData) {
-                        const memCoin = botData.settings.coins.find(c => c.symbol === coin.symbol);
-                        if (memCoin) memCoin.botActive = false;
-
-                        if (botData.state.coinStates[coin.symbol]) {
-                            botData.state.coinStates[coin.symbol].status = 'Stopped';
-                            botData.state.coinStates[coin.symbol].contracts = 0;
-                            botData.state.coinStates[coin.symbol].unrealizedPnl = 0;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Save switches to database
-        await settings.save();
-        
-        res.json({ success: true, message: `🚨 Successfully force-closed ${closedCount} positions and stopped their bots in memory.` });
-
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
 });
 
 // ==========================================
@@ -735,22 +608,8 @@ app.get('/', (req, res) => {
                 <h1>HTX Trading Bot</h1>
                 <div style="display:flex; gap:12px;">
                     <button class="btn-blue" style="margin:0; width:auto; padding: 8px 16px;" onclick="switchTab('main')">Dashboard</button>
-                    <button class="btn-logout" style="margin:0; width:auto;" onclick="switchTab('idle')">Idle Coins</button>
                     <button class="btn-logout" style="margin:0; width:auto;" onclick="switchTab('offsets')">Smart Offsets</button>
                     <button class="btn-logout" style="margin:0; width:auto;" onclick="logout()">Logout</button>
-                </div>
-            </div>
-
-            <!-- IDLE COINS TAB -->
-            <div id="idle-tab" style="display:none;">
-                <div class="panel">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h2 style="color: #d93025; border:none; margin:0;">Coins Closed Due to Being Idle</h2>
-                        <button class="btn-red" style="margin:0; width:auto; font-weight:bold;" onclick="forceCloseIdleCoins()">
-                            🚨 Force Close & Stop All Idle Coins
-                        </button>
-                    </div>
-                    <div id="idleTableContainer" style="margin-top: 20px;">No idle coins closed yet.</div>
                 </div>
             </div>
 
@@ -867,7 +726,7 @@ app.get('/', (req, res) => {
                                 <h4 style="margin-top: 0; color: #1a73e8; margin-bottom: 12px;">Bulk Add Predefined Coins</h4>
                                 <div class="flex-row" style="margin-bottom: 12px;">
                                     <div style="flex:1;"><label style="margin-top:0;">Initial Status</label><select id="predefStatus"><option value="stopped">Leave All Stopped</option><option value="started">Start All Coins</option></select></div>
-                                    <div style="flex:1;"><label style="margin-top:0;">Trading Side</label><select id="predefSide"><option value="oddLong">Odd=Long / Even=Short</option><option value="evenLong">Even=Long / Odd=Short</option><option value="allLong">All Short</option><option value="allShort">All Short</option></select></div>
+                                    <div style="flex:1;"><label style="margin-top:0;">Trading Side</label><select id="predefSide"><option value="oddLong">Odd=Long / Even=Short</option><option value="evenLong">Even=Long / Odd=Short</option><option value="allLong">All Long</option><option value="allShort">All Short</option></select></div>
                                 </div>
                                 <button class="btn-blue" style="margin-top: 0;" onclick="addPredefinedList()">+ Add All Predefined</button>
                             </div>
@@ -930,13 +789,10 @@ app.get('/', (req, res) => {
 
             function switchTab(tab) {
                 document.getElementById('main-tab').style.display = 'none';
-                document.getElementById('idle-tab').style.display = 'none';
                 document.getElementById('offset-tab').style.display = 'none';
 
                 if (tab === 'main') {
                     document.getElementById('main-tab').style.display = 'block';
-                } else if (tab === 'idle') {
-                    document.getElementById('idle-tab').style.display = 'block';
                 } else if (tab === 'offsets') {
                     document.getElementById('offset-tab').style.display = 'block';
                     loadOffsets();
@@ -968,22 +824,6 @@ app.get('/', (req, res) => {
             function logout() { localStorage.removeItem('token'); token = null; checkAuth(); }
             function toggleNewKeys(cb) { const type = cb.checked ? 'text' : 'password'; document.getElementById('newSubKey').type = type; document.getElementById('newSubSecret').type = type; }
             function toggleActiveKeys(cb) { const type = cb.checked ? 'text' : 'password'; document.getElementById('apiKey').type = type; document.getElementById('secret').type = type; }
-
-            async function forceCloseIdleCoins() {
-                if (!confirm("🚨 WARNING: This will scan HTX and Force Market-Close ALL positions for coins listed in the Idle History. Continue?")) return;
-                
-                try {
-                    const res = await fetch('/api/idle/force-close', { 
-                        method: 'POST', 
-                        headers: { 'Authorization': 'Bearer ' + token } 
-                    });
-                    const data = await res.json();
-                    alert(data.message || data.error);
-                    fetchSettings(); // Refresh UI to show them as stopped
-                } catch (err) {
-                    alert("Error executing force close.");
-                }
-            }
 
             async function fetchSettings() {
                 const res = await fetch('/api/settings', { headers: { 'Authorization': 'Bearer ' + token } });
@@ -1217,20 +1057,7 @@ app.get('/', (req, res) => {
                 const data = await res.json();
                 const allStatuses = data.states || {};
                 const subAccountsUpdated = data.subAccounts || [];
-                const serverIdleRecords = data.idleRecords || [];
                 const globalSet = data.globalSettings || {};
-                
-                if (serverIdleRecords.length === 0) {
-                    document.getElementById('idleTableContainer').innerHTML = '<p style="color:#5f6368;">No idle coins closed yet.</p>';
-                } else {
-                    let ih = '<table style="width:100%; text-align:left; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden;"><tr style="background:#f8f9fa;"><th style="padding:12px; border-bottom:2px solid #dadce0;">Date/Time</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Profile Name</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Coin Pair</th></tr>';
-                    serverIdleRecords.forEach(r => {
-                        const dateObj = new Date(r.timestamp);
-                        ih += \`<tr><td style="padding:12px; border-bottom:1px solid #eee; color:#5f6368;">\${dateObj.toLocaleDateString()} \${dateObj.toLocaleTimeString()}</td><td style="padding:12px; border-bottom:1px solid #eee; font-weight:500;">\${r.profileName}</td><td style="padding:12px; border-bottom:1px solid #eee; color:#1a73e8; font-weight:500;">\${r.symbol}</td></tr>\`;
-                    });
-                    ih += '</table>';
-                    document.getElementById('idleTableContainer').innerHTML = ih;
-                }
 
                 let globalTotal = 0;
                 subAccountsUpdated.forEach(sub => {
