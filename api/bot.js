@@ -64,6 +64,7 @@ const SettingsSchema = new mongoose.Schema({
     smartOffsetStopLoss: { type: Number, default: 0 },
     smartOffsetNetProfit2: { type: Number, default: 0 }, 
     smartOffsetStopLoss2: { type: Number, default: 0 },   
+    smartOffsetMaxLossPerMinute: { type: Number, default: 0 }, // New Setting
     subAccounts: [SubAccountSchema]
 });
 const Settings = mongoose.model('Settings', SettingsSchema);
@@ -85,6 +86,7 @@ const OffsetRecord = mongoose.model('OffsetRecord', OffsetRecordSchema);
 const activeBots = new Map();
 const globalPnlPeaks = new Map(); 
 const lastStopLossExecutions = new Map(); // Tracks last Stop Loss timestamp to enforce 1 per min rule
+const rollingStopLosses = new Map(); // Tracks accumulation of Stop Loss dollar amounts over 60 seconds
 
 function logForProfile(profileId, msg) {
     console.log(`[Profile: ${profileId}] ${msg}`);
@@ -281,11 +283,18 @@ setInterval(async () => {
             const smartOffsetStopLoss = parseFloat(userSetting.smartOffsetStopLoss) || 0;
             const smartOffsetNetProfit2 = parseFloat(userSetting.smartOffsetNetProfit2) || 0;
             const smartOffsetStopLoss2 = parseFloat(userSetting.smartOffsetStopLoss2) || 0;
+            const smartOffsetMaxLossPerMinute = parseFloat(userSetting.smartOffsetMaxLossPerMinute) || 0;
             
             let globalUnrealized = 0;
             let activeCandidates = [];
             let firstProfileId = null; 
             let totalAllCoinsUser = 0;
+
+            // Rolling Loss Tracker logic
+            let rollingLossArr = rollingStopLosses.get(dbUserId) || [];
+            rollingLossArr = rollingLossArr.filter(record => Date.now() - record.time < 60000);
+            rollingStopLosses.set(dbUserId, rollingLossArr);
+            let currentMinuteLoss = rollingLossArr.reduce((sum, record) => sum + record.amount, 0);
 
             for (let [profileId, botData] of activeBots.entries()) {
                 if (botData.userId !== dbUserId) continue;
@@ -344,11 +353,19 @@ setInterval(async () => {
                         triggerOffset = true;
                         reason = `TAKE PROFIT (Dyn: $${dynamicTargetV1.toFixed(4)})`;
                     } else if (smartOffsetStopLoss < 0 && netResult <= dynamicStopLossV1) {
-                        // Rate Limiter: Maximum 1 Stop Loss per minute across V1 and V2
-                        if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
-                            triggerOffset = true;
-                            reason = `STOP LOSS (Dyn: $${dynamicStopLossV1.toFixed(4)})`;
-                            lastStopLossExecutions.set(dbUserId, Date.now());
+                        // Rate Limiter Logic
+                        if (smartOffsetMaxLossPerMinute > 0) {
+                            if (currentMinuteLoss + Math.abs(netResult) <= smartOffsetMaxLossPerMinute) {
+                                triggerOffset = true;
+                                reason = `STOP LOSS (Dyn: $${dynamicStopLossV1.toFixed(4)})`;
+                            }
+                        } else {
+                            // Classic 1 per minute enforcement if setting is 0
+                            if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
+                                triggerOffset = true;
+                                reason = `STOP LOSS (Dyn: $${dynamicStopLossV1.toFixed(4)})`;
+                                lastStopLossExecutions.set(dbUserId, Date.now());
+                            }
                         }
                     }
                     
@@ -377,14 +394,16 @@ setInterval(async () => {
                         activeBots.get(biggestLoser.profileId).state.coinStates[biggestLoser.symbol].contracts = 0;
                         
                         offsetExecuted = true;
+                        if (netResult < 0 && smartOffsetMaxLossPerMinute > 0) {
+                            currentMinuteLoss += Math.abs(netResult);
+                            rollingLossArr.push({ time: Date.now(), amount: Math.abs(netResult) });
+                        }
                     }
                 }
             }
 
             // SMART OFFSET V2 (ENDS / OUTSIDE-IN)
             if (!offsetExecuted && (smartOffsetNetProfit2 > 0 || smartOffsetStopLoss2 < 0) && activeCandidates.length >= 2) {
-                // List is already sorted descending by unrealizedPnl
-                
                 let offsetExecuted2 = false;
                 const totalCoins = activeCandidates.length;
                 const totalPairs = Math.floor(totalCoins / 2);
@@ -405,11 +424,19 @@ setInterval(async () => {
                         triggerOffset = true;
                         reason = `TAKE PROFIT V2 (Dyn: $${dynamicTargetV2.toFixed(4)})`;
                     } else if (smartOffsetStopLoss2 < 0 && netResult <= dynamicStopLossV2) {
-                        // Rate Limiter: Maximum 1 Stop Loss per minute across V1 and V2
-                        if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
-                            triggerOffset = true;
-                            reason = `STOP LOSS V2 (Dyn: $${dynamicStopLossV2.toFixed(4)})`;
-                            lastStopLossExecutions.set(dbUserId, Date.now());
+                        // Rate Limiter Logic
+                        if (smartOffsetMaxLossPerMinute > 0) {
+                            if (currentMinuteLoss + Math.abs(netResult) <= smartOffsetMaxLossPerMinute) {
+                                triggerOffset = true;
+                                reason = `STOP LOSS V2 (Dyn: $${dynamicStopLossV2.toFixed(4)})`;
+                            }
+                        } else {
+                            // Classic 1 per minute enforcement if setting is 0
+                            if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
+                                triggerOffset = true;
+                                reason = `STOP LOSS V2 (Dyn: $${dynamicStopLossV2.toFixed(4)})`;
+                                lastStopLossExecutions.set(dbUserId, Date.now());
+                            }
                         }
                     }
                     
@@ -438,6 +465,10 @@ setInterval(async () => {
                         activeBots.get(biggestLoser.profileId).state.coinStates[biggestLoser.symbol].contracts = 0;
                         
                         offsetExecuted2 = true;
+                        if (netResult < 0 && smartOffsetMaxLossPerMinute > 0) {
+                            currentMinuteLoss += Math.abs(netResult);
+                            rollingLossArr.push({ time: Date.now(), amount: Math.abs(netResult) });
+                        }
                     }
                 }
                 
@@ -535,7 +566,7 @@ app.post('/api/register', async (req, res) => {
         const { username, password } = req.body;
         const hashedPassword = await bcrypt.hash(password, 10);
         const user = await User.create({ username, password: hashedPassword });
-        await Settings.create({ userId: user._id, subAccounts: [], globalTargetPnl: 0, globalTrailingPnl: 0, smartOffsetNetProfit: 0, smartOffsetStopLoss: 0, smartOffsetNetProfit2: 0, smartOffsetStopLoss2: 0 });
+        await Settings.create({ userId: user._id, subAccounts: [], globalTargetPnl: 0, globalTrailingPnl: 0, smartOffsetNetProfit: 0, smartOffsetStopLoss: 0, smartOffsetNetProfit2: 0, smartOffsetStopLoss2: 0, smartOffsetMaxLossPerMinute: 0 });
         res.json({ success: true, message: 'Registration successful!' });
     } catch (err) {
         res.status(400).json({ error: 'Username already exists or invalid data.' });
@@ -557,7 +588,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/settings', authMiddleware, async (req, res) => {
-    const { subAccounts, globalTargetPnl, globalTrailingPnl, smartOffsetNetProfit, smartOffsetStopLoss, smartOffsetNetProfit2, smartOffsetStopLoss2 } = req.body;
+    const { subAccounts, globalTargetPnl, globalTrailingPnl, smartOffsetNetProfit, smartOffsetStopLoss, smartOffsetNetProfit2, smartOffsetStopLoss2, smartOffsetMaxLossPerMinute } = req.body;
     
     const existingSettings = await Settings.findOne({ userId: req.userId });
     if (existingSettings && existingSettings.subAccounts) {
@@ -591,7 +622,8 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
             smartOffsetNetProfit: parseFloat(smartOffsetNetProfit) || 0,
             smartOffsetStopLoss: parsedStopLoss,
             smartOffsetNetProfit2: parseFloat(smartOffsetNetProfit2) || 0,
-            smartOffsetStopLoss2: parsedStopLoss2
+            smartOffsetStopLoss2: parsedStopLoss2,
+            smartOffsetMaxLossPerMinute: parseFloat(smartOffsetMaxLossPerMinute) || 0
         }, 
         { returnDocument: 'after' }
     );
@@ -624,7 +656,16 @@ app.get('/api/status', authMiddleware, async (req, res) => {
         if (botData.userId === req.userId.toString()) userStatuses[profileId] = botData.state;
     }
 
-    res.json({ states: userStatuses, subAccounts: settings ? settings.subAccounts : [], globalSettings: settings });
+    // Clean and return current 60s minute loss to UI
+    let currentMinuteLoss = 0;
+    const dbUserId = req.userId.toString();
+    if (rollingStopLosses.has(dbUserId)) {
+        let arr = rollingStopLosses.get(dbUserId).filter(r => Date.now() - r.time < 60000);
+        currentMinuteLoss = arr.reduce((sum, r) => sum + r.amount, 0);
+        rollingStopLosses.set(dbUserId, arr); 
+    }
+
+    res.json({ states: userStatuses, subAccounts: settings ? settings.subAccounts : [], globalSettings: settings, currentMinuteLoss });
 });
 
 app.get('/api/offsets', authMiddleware, async (req, res) => {
@@ -787,6 +828,11 @@ app.get('/', (req, res) => {
                                 <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Always evaluates! If the paired coins' Net PNL drops to or below this negative amount, it closes BOTH.</p>
                                 <input type="number" step="0.1" id="smartOffsetStopLoss" placeholder="e.g. -2.00 (0 = Disabled)">
                             </div>
+                            <div style="margin-top: 12px; border-top: 1px solid #cce0ff; padding-top: 12px;">
+                                <label style="margin-top:0;">Max Stop Loss Amount Allowed Per Minute ($)</label>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">If > 0, allows multiple stop losses per minute as long as the total combined loss is under this amount. If 0, limits exactly to 1 SL per minute regardless of amount. *(Must be large enough to cover the single largest SL execution)*.</p>
+                                <input type="number" step="0.1" id="smartOffsetMaxLossPerMinute" placeholder="e.g. 10.00 (0 = classic 1 per min rule)">
+                            </div>
                             <button class="btn-blue" style="margin-top:16px;" onclick="saveGlobalSettings()">Save Global Settings</button>
                         </div>
 
@@ -893,6 +939,7 @@ app.get('/', (req, res) => {
             let mySmartOffsetStopLoss = 0;
             let mySmartOffsetNetProfit2 = 0;
             let mySmartOffsetStopLoss2 = 0;
+            let mySmartOffsetMaxLossPerMinute = 0;
             let currentProfileIndex = -1;
             let myCoins = [];
             
@@ -964,6 +1011,7 @@ app.get('/', (req, res) => {
                 mySmartOffsetStopLoss = config.smartOffsetStopLoss || 0;
                 mySmartOffsetNetProfit2 = config.smartOffsetNetProfit2 || 0;
                 mySmartOffsetStopLoss2 = config.smartOffsetStopLoss2 || 0;
+                mySmartOffsetMaxLossPerMinute = config.smartOffsetMaxLossPerMinute || 0;
                 
                 document.getElementById('globalTargetPnl').value = myGlobalTargetPnl;
                 document.getElementById('globalTrailingPnl').value = myGlobalTrailingPnl;
@@ -971,6 +1019,7 @@ app.get('/', (req, res) => {
                 document.getElementById('smartOffsetStopLoss').value = mySmartOffsetStopLoss;
                 document.getElementById('smartOffsetNetProfit2').value = mySmartOffsetNetProfit2;
                 document.getElementById('smartOffsetStopLoss2').value = mySmartOffsetStopLoss2;
+                document.getElementById('smartOffsetMaxLossPerMinute').value = mySmartOffsetMaxLossPerMinute;
 
                 mySubAccounts = config.subAccounts || [];
                 renderSubAccounts();
@@ -991,8 +1040,9 @@ app.get('/', (req, res) => {
                 mySmartOffsetStopLoss = parseFloat(document.getElementById('smartOffsetStopLoss').value) || 0;
                 mySmartOffsetNetProfit2 = parseFloat(document.getElementById('smartOffsetNetProfit2').value) || 0;
                 mySmartOffsetStopLoss2 = parseFloat(document.getElementById('smartOffsetStopLoss2').value) || 0;
+                mySmartOffsetMaxLossPerMinute = parseFloat(document.getElementById('smartOffsetMaxLossPerMinute').value) || 0;
                 
-                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2 };
+                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2, smartOffsetMaxLossPerMinute: mySmartOffsetMaxLossPerMinute };
                 await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data) });
                 alert('Global Settings Saved Successfully!');
             }
@@ -1012,7 +1062,7 @@ app.get('/', (req, res) => {
                 
                 mySubAccounts.push({ name, apiKey: key, secret: secret, side: 'long', leverage: 10, baseQty: 1, takeProfitPct: 5.0, stopLossPct: -25.0, triggerRoiPct: -15.0, dcaTargetRoiPct: -2.0, maxContracts: 1000, realizedPnl: 0, coins: [] });
                 
-                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2 };
+                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2, smartOffsetMaxLossPerMinute: mySmartOffsetMaxLossPerMinute };
                 const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data) });
                 const json = await res.json();
                 mySubAccounts = json.settings.subAccounts || [];
@@ -1056,7 +1106,7 @@ app.get('/', (req, res) => {
                 const index = parseInt(select.value);
                 if(!isNaN(index) && index >= 0) {
                     mySubAccounts.splice(index, 1);
-                    const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2 };
+                    const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2, smartOffsetMaxLossPerMinute: mySmartOffsetMaxLossPerMinute };
                     const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data) });
                     const json = await res.json();
                     mySubAccounts = json.settings.subAccounts || [];
@@ -1138,7 +1188,7 @@ app.get('/', (req, res) => {
                 profile.maxContracts = parseInt(document.getElementById('maxContracts').value);
                 profile.coins = myCoins;
 
-                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2 };
+                const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2, smartOffsetMaxLossPerMinute: mySmartOffsetMaxLossPerMinute };
                 const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data) });
                 const json = await res.json();
                 mySubAccounts = json.settings.subAccounts || [];
@@ -1195,6 +1245,7 @@ app.get('/', (req, res) => {
                 const allStatuses = data.states || {};
                 const subAccountsUpdated = data.subAccounts || [];
                 const globalSet = data.globalSettings || {};
+                const currentMinuteLoss = data.currentMinuteLoss || 0;
 
                 let globalTotal = 0;
                 subAccountsUpdated.forEach(sub => {
@@ -1232,6 +1283,11 @@ app.get('/', (req, res) => {
                 });
                 let dynamicDivisor = totalAllCoinsUser / (totalTrading || 1);
                 if (dynamicDivisor <= 0 || isNaN(dynamicDivisor)) dynamicDivisor = 1;
+
+                const maxLossPerMin = globalSet.smartOffsetMaxLossPerMinute || 0;
+                const lossTrackerHtml = maxLossPerMin > 0 
+                    ? \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>60s Loss Tracker:</strong> $\${currentMinuteLoss.toFixed(2)} / $\${maxLossPerMin.toFixed(2)} Limit</div>\`
+                    : \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>60s Loss Tracker:</strong> Limited to 1 SL execution per minute</div>\`;
                 
                 // --- RENDER LIVE SMART OFFSET TRADES (V1 - Half Split) ---
                 if (document.getElementById('offset-tab').style.display === 'block') {
@@ -1250,6 +1306,7 @@ app.get('/', (req, res) => {
                         let dynamicInfoHtml = \`<div style="margin-bottom: 12px; padding: 10px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 4px; color: #1a73e8; font-weight: 500;">
                             <div style="margin-bottom: 4px;">🎯 Dynamic Take Profit: $\${dynamicTargetV1.toFixed(4)} <span style="font-size: 0.85em; color: #5f6368; font-weight: normal;">(Base: $\${currentTarget.toFixed(2)})</span></div>
                             <div>🛑 Dynamic Stop Loss: $\${dynamicSlV1.toFixed(4)} <span style="font-size: 0.85em; color: #5f6368; font-weight: normal;">(Base: $\${currentSl.toFixed(2)})</span></div>
+                            \${lossTrackerHtml}
                             <div style="font-size: 0.85em; color: #5f6368; font-weight: normal; margin-top: 6px;">
                                 Formula: Base Target / (Total Active Coins \${totalAllCoinsUser} / Trading Coins \${totalTrading})
                             </div>
@@ -1272,7 +1329,13 @@ app.get('/', (req, res) => {
                             
                             const isTargetHit = (currentTarget > 0 && net >= dynamicTargetV1);
                             const isStopHit = (currentSl < 0 && net <= dynamicSlV1);
-                            const statusIcon = (isTargetHit || isStopHit) ? '🔥 Executing...' : '⏳ Evaluating';
+                            
+                            let statusIcon = '⏳ Evaluating';
+                            if (isTargetHit) statusIcon = '🔥 Executing (TP)...';
+                            else if (isStopHit) {
+                                if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(net)) > maxLossPerMin) statusIcon = '🛑 BLOCKED (Limit Reached)';
+                                else statusIcon = '🔥 Executing (SL)...';
+                            }
 
                             liveHtml += \`<tr>
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; color:#5f6368;">\${loserIndex + 1} & \${winnerIndex + 1} <br><span style="font-size:0.75em; color:#1a73e8">\${statusIcon}</span></td>
@@ -1312,6 +1375,7 @@ app.get('/', (req, res) => {
                         let dynamicInfoHtml2 = \`<div style="margin-bottom: 12px; padding: 10px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 4px; color: #1a73e8; font-weight: 500;">
                             <div style="margin-bottom: 4px;">🎯 Dynamic Take Profit V2: $\${dynamicTargetV2.toFixed(4)} <span style="font-size: 0.85em; color: #5f6368; font-weight: normal;">(Base: $\${currentTarget2.toFixed(2)})</span></div>
                             <div>🛑 Dynamic Stop Loss V2: $\${dynamicSlV2.toFixed(4)} <span style="font-size: 0.85em; color: #5f6368; font-weight: normal;">(Base: $\${currentSl2.toFixed(2)})</span></div>
+                            \${lossTrackerHtml}
                             <div style="font-size: 0.85em; color: #5f6368; font-weight: normal; margin-top: 6px;">
                                 Formula: Base Target / (Total Active Coins \${totalAllCoinsUser} / Trading Coins \${totalTrading})
                             </div>
@@ -1334,7 +1398,13 @@ app.get('/', (req, res) => {
                             
                             const isTargetHit = (currentTarget2 > 0 && net >= dynamicTargetV2);
                             const isStopHit = (currentSl2 < 0 && net <= dynamicSlV2);
-                            const statusIcon = (isTargetHit || isStopHit) ? '🔥 Executing...' : '⏳ Evaluating';
+                            
+                            let statusIcon = '⏳ Evaluating';
+                            if (isTargetHit) statusIcon = '🔥 Executing (TP)...';
+                            else if (isStopHit) {
+                                if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(net)) > maxLossPerMin) statusIcon = '🛑 BLOCKED (Limit Reached)';
+                                else statusIcon = '🔥 Executing (SL)...';
+                            }
 
                             liveHtml += \`<tr>
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; color:#5f6368;">\${winnerIndex + 1} & \${loserIndex + 1} <br><span style="font-size:0.75em; color:#1a73e8">\${statusIcon}</span></td>
