@@ -329,7 +329,7 @@ setInterval(async () => {
             let offsetExecuted = false;
 
             // ====================================================
-            // SMART OFFSET V1 (GROUPED ACCUMULATION: Top Vs Bottom)
+            // SMART OFFSET V1 (DYNAMIC PEAK HARVESTING)
             // ====================================================
             if ((smartOffsetNetProfit > 0 || smartOffsetStopLoss < 0) && activeCandidates.length >= 2) {
                 activeCandidates.sort((a, b) => b.unrealizedPnl - a.unrealizedPnl); 
@@ -337,99 +337,102 @@ setInterval(async () => {
                 const totalCoins = activeCandidates.length;
                 const totalPairs = Math.floor(totalCoins / 2);
 
-                // 1. PRE-SCAN: Check if the WHOLE Group Accumulation column is positive
-                let isTpEnabled = true;
-                let preScanAccumulation = 0;
+                let runningAccumulation = 0;
+                let peakAccumulation = 0;
+                let peakRowIndex = -1;
+
+                // 1. Calculate running accumulation and find the exact PEAK row
                 for (let i = 0; i < totalPairs; i++) {
                     const w = activeCandidates[i];
                     const l = activeCandidates[totalCoins - totalPairs + i];
-                    preScanAccumulation += (w.unrealizedPnl + l.unrealizedPnl);
-                    if (preScanAccumulation <= 0) {
-                        isTpEnabled = false; // A row dropped <= 0, so disable TP!
-                        break;
+                    const netResult = w.unrealizedPnl + l.unrealizedPnl;
+                    
+                    runningAccumulation += netResult;
+
+                    if (runningAccumulation > peakAccumulation) {
+                        peakAccumulation = runningAccumulation;
+                        peakRowIndex = i;
                     }
                 }
 
-                let v1Bucket = [];
-                let v1BucketNet = 0;
+                let triggerOffset = false;
+                let reason = '';
+                let finalPairsToClose = [];
+                let finalNetProfit = 0;
 
-                for (let i = 0; i < totalPairs; i++) {
-                    const winnerIndex = i; 
-                    const loserIndex = totalCoins - totalPairs + i; 
-
-                    const biggestWinner = activeCandidates[winnerIndex];
-                    const biggestLoser = activeCandidates[loserIndex];
-
-                    const netResult = biggestWinner.unrealizedPnl + biggestLoser.unrealizedPnl;
+                // 2. Evaluate the Peak for Take Profit
+                // Slices the group strictly at the peak if the peak is >= Target
+                if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0) {
+                    triggerOffset = true;
+                    reason = `TAKE PROFIT (Harvested Peak at Row ${peakRowIndex + 1}, Target: $${targetV1.toFixed(4)})`;
+                    finalNetProfit = peakAccumulation;
                     
-                    // Accumulate pairs into the bucket
-                    v1Bucket.push(biggestWinner);
-                    v1Bucket.push(biggestLoser);
-                    v1BucketNet += netResult;
+                    for(let i = 0; i <= peakRowIndex; i++) {
+                        finalPairsToClose.push(activeCandidates[i]);
+                        finalPairsToClose.push(activeCandidates[totalCoins - totalPairs + i]);
+                    }
+                } 
+                // 3. Evaluate Stop Loss (Evaluates the total accumulation of ALL pairs)
+                else if (smartOffsetStopLoss < 0 && runningAccumulation <= stopLossV1) {
+                    let allowSl = false;
+                    if (smartOffsetMaxLossPerMinute > 0) {
+                        if (currentMinuteLoss + Math.abs(runningAccumulation) <= smartOffsetMaxLossPerMinute) allowSl = true;
+                    } else {
+                        if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) allowSl = true;
+                    }
 
-                    let triggerOffset = false;
-                    let reason = '';
-
-                    // STRICT RULE: TP is only allowed if isTpEnabled is true
-                    if (smartOffsetNetProfit > 0 && v1BucketNet >= targetV1 && isTpEnabled) {
+                    if (allowSl) {
                         triggerOffset = true;
-                        reason = `TAKE PROFIT (Group of ${v1Bucket.length/2} Pairs, Target: $${targetV1.toFixed(4)})`;
-                    } else if (smartOffsetStopLoss < 0 && v1BucketNet <= stopLossV1) {
-                        if (smartOffsetMaxLossPerMinute > 0) {
-                            if (currentMinuteLoss + Math.abs(v1BucketNet) <= smartOffsetMaxLossPerMinute) {
-                                triggerOffset = true;
-                                reason = `STOP LOSS (Group of ${v1Bucket.length/2} Pairs, Target: $${stopLossV1.toFixed(4)})`;
-                            }
-                        } else {
-                            if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= 60000) {
-                                triggerOffset = true;
-                                reason = `STOP LOSS (Group of ${v1Bucket.length/2} Pairs, Target: $${stopLossV1.toFixed(4)})`;
-                                lastStopLossExecutions.set(dbUserId, Date.now());
-                            }
+                        reason = `STOP LOSS (Full Group limit hit: $${stopLossV1.toFixed(4)})`;
+                        finalNetProfit = runningAccumulation;
+                        if(smartOffsetMaxLossPerMinute <= 0) lastStopLossExecutions.set(dbUserId, Date.now());
+
+                        for(let i = 0; i < totalPairs; i++) {
+                            finalPairsToClose.push(activeCandidates[i]);
+                            finalPairsToClose.push(activeCandidates[totalCoins - totalPairs + i]);
                         }
+                    }
+                }
+
+                // 4. EXECUTE CLOSE
+                if (triggerOffset) {
+                    logForProfile(firstProfileId, `⚖️ SMART OFFSET V1 [${reason}]: Closing ${finalPairsToClose.length} coins total. NET PROFIT: ${finalNetProfit >= 0 ? '+' : ''}$${finalNetProfit.toFixed(4)}`);
+                    
+                    let totalWinnerPnl = 0;
+                    let totalLoserPnl = 0;
+
+                    for (let k = 0; k < finalPairsToClose.length; k++) {
+                        const pos = finalPairsToClose[k];
+                        if (k % 2 === 0) totalWinnerPnl += pos.unrealizedPnl;
+                        else totalLoserPnl += pos.unrealizedPnl;
+
+                        try {
+                            const orderSide = pos.side === 'long' ? 'sell' : 'buy';
+                            await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage }).catch(()=>{});
+                            pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
+                            await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
+                            activeBots.get(pos.profileId).state.coinStates[pos.symbol].contracts = 0;
+                        } catch (e) {
+                            logForProfile(pos.profileId, `❌ Failed Group Close on ${pos.symbol}: ${e.message}`);
+                        }
+                    }
+
+                    OffsetRecord.create({
+                        userId: dbUserId,
+                        winnerSymbol: `Peak of ${finalPairsToClose.length/2} Winners`,
+                        winnerPnl: totalWinnerPnl,
+                        loserSymbol: `Peak of ${finalPairsToClose.length/2} Losers`,
+                        loserPnl: totalLoserPnl,
+                        netProfit: finalNetProfit
+                    }).catch(()=>{});
+
+                    offsetExecuted = true;
+                    if (finalNetProfit < 0 && smartOffsetMaxLossPerMinute > 0) {
+                        currentMinuteLoss += Math.abs(finalNetProfit);
+                        rollingLossArr.push({ time: Date.now(), amount: Math.abs(finalNetProfit) });
                     }
                     
-                    if (triggerOffset) {
-                        logForProfile(firstProfileId, `⚖️ SMART OFFSET V1 (GROUPED) [${reason}]: Closing ${v1Bucket.length} coins total. NET PROFIT: ${v1BucketNet >= 0 ? '+' : ''}$${v1BucketNet.toFixed(4)}`);
-                        
-                        let totalWinnerPnl = 0;
-                        let totalLoserPnl = 0;
-
-                        // Close ALL coins in the group bucket
-                        for (let k = 0; k < v1Bucket.length; k++) {
-                            const pos = v1Bucket[k];
-                            
-                            if (k % 2 === 0) totalWinnerPnl += pos.unrealizedPnl;
-                            else totalLoserPnl += pos.unrealizedPnl;
-
-                            try {
-                                const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                                await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage }).catch(()=>{});
-                                pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
-                                await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
-                                activeBots.get(pos.profileId).state.coinStates[pos.symbol].contracts = 0;
-                            } catch (e) {
-                                logForProfile(pos.profileId, `❌ Failed Group Close on ${pos.symbol}: ${e.message}`);
-                            }
-                        }
-
-                        OffsetRecord.create({
-                            userId: dbUserId,
-                            winnerSymbol: `Group of ${v1Bucket.length/2} Winners`,
-                            winnerPnl: totalWinnerPnl,
-                            loserSymbol: `Group of ${v1Bucket.length/2} Losers`,
-                            loserPnl: totalLoserPnl,
-                            netProfit: v1BucketNet
-                        }).catch(()=>{});
-
-                        offsetExecuted = true;
-                        if (v1BucketNet < 0 && smartOffsetMaxLossPerMinute > 0) {
-                            currentMinuteLoss += Math.abs(v1BucketNet);
-                            rollingLossArr.push({ time: Date.now(), amount: Math.abs(v1BucketNet) });
-                        }
-                        
-                        break; 
-                    }
+                    break;
                 }
             }
 
@@ -779,8 +782,8 @@ app.get('/', (req, res) => {
             <!-- SMART OFFSETS HISTORY & LIVE TAB -->
             <div id="offset-tab" style="display:none;">
                 <div class="panel">
-                    <h2 style="color: #1a73e8;">Live Accumulation Grouping (Top Vs Bottom)</h2>
-                    <p style="font-size:0.85em; color:#5f6368; margin-top:-8px; margin-bottom:16px;">This engine adds Pair 1 + Pair 2 + Pair 3 together into a Bucket. As soon as the "Group Accumulation" column hits your Target (or hits Stop Loss), it closes ALL coins in the group at once. Perfect for combining multiple small winners to clear out losers.</p>
+                    <h2 style="color: #1a73e8;">Live Accumulation Grouping (Dynamic Peak Harvester)</h2>
+                    <p style="font-size:0.85em; color:#5f6368; margin-top:-8px; margin-bottom:16px;">This engine scans the "Group Accumulation" column to find the exact row where the profit hits its peak. If that peak reaches your Target, it chops the list right there and closes those profitable pairs, leaving the losers at the bottom to recover.</p>
                     <div id="liveOffsetsContainer">Waiting for live data...</div>
                 </div>
                 
@@ -1328,28 +1331,38 @@ app.get('/', (req, res) => {
                         let liveHtml = '<table style="width:100%; text-align:left; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden;">';
                         liveHtml += '<tr style="background:#e8f0fe;"><th style="padding:12px; border-bottom:2px solid #dadce0;">Rank Pair</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Pair Net</th><th style="padding:12px; border-bottom:2px solid #dadce0; color:#1a73e8;">Group Accumulation</th></tr>';
 
-                        // 1. PRE-SCAN to see if the entire column is positive
-                        let isTpEnabled = true;
-                        let preScanAccum = 0;
+                        let runningAccumulation = 0;
+                        let peakAccumulation = 0;
+                        let peakRowIndex = -1;
+
+                        // Calculate the peak first
                         for (let i = 0; i < totalPairs; i++) {
                             const w = activeCandidates[i];
                             const l = activeCandidates[totalCoins - totalPairs + i];
-                            preScanAccum += (w.pnl + l.pnl);
-                            if (preScanAccum <= 0) {
-                                isTpEnabled = false;
+                            const net = w.pnl + l.pnl;
+                            runningAccumulation += net;
+                            if (runningAccumulation > peakAccumulation) {
+                                peakAccumulation = runningAccumulation;
+                                peakRowIndex = i;
                             }
                         }
 
-                        let cumulativeNet = 0;
-                        let groupTriggered = false;
-                        let topStatusMessage = '';
-                        
-                        // Text for the UI
-                        let tpStatusText = isTpEnabled 
-                            ? '<span style="color:#1e8e3e; font-weight:bold;">✅ ENABLED (All Accumulations > 0)</span>' 
-                            : '<span style="color:#d93025; font-weight:bold;">❌ DISABLED (A row is <= 0)</span>';
+                        let topStatusMessage = '<span style="color:#f29900;">⏳ Scanning for peak... Target not reached yet.</span>';
+                        let executingPeak = false;
+                        let executingSl = false;
 
-                        // 2. MAIN RENDER LOOP
+                        if (targetV1 > 0 && peakAccumulation >= targetV1 && peakRowIndex >= 0) {
+                            topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)})!</span>\`;
+                            executingPeak = true;
+                        } else if (stopLossV1 < 0 && runningAccumulation <= stopLossV1) {
+                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit for the whole group!</span>\`;
+                            executingSl = true;
+                        } else {
+                            let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
+                            topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak Found: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
+                        }
+
+                        let displayAccumulation = 0;
                         for (let i = 0; i < totalPairs; i++) {
                             const winnerIndex = i;
                             const loserIndex = totalCoins - totalPairs + i;
@@ -1357,51 +1370,34 @@ app.get('/', (req, res) => {
                             const w = activeCandidates[winnerIndex];
                             const l = activeCandidates[loserIndex];
                             const net = w.pnl + l.pnl;
+                            displayAccumulation += net;
                             
-                            if (!groupTriggered) {
-                                cumulativeNet += net;
+                            let statusIcon = '⏳ Waiting';
+                            if (executingPeak) {
+                                if (i <= peakRowIndex) statusIcon = '🔥 Harvesting Peak';
+                                else statusIcon = '⏸️ Ignored (Past Peak)';
+                            } else if (executingSl) {
+                                statusIcon = '🔥 Executing (SL)';
+                            } else {
+                                if (i <= peakRowIndex) statusIcon = '📈 Part of Peak';
+                                else statusIcon = '📉 Dragging down';
                             }
 
                             const wColor = w.pnl >= 0 ? '#1e8e3e' : '#d93025';
                             const lColor = l.pnl >= 0 ? '#1e8e3e' : '#d93025';
                             const nColor = net >= 0 ? '#1e8e3e' : '#d93025';
-                            const cColor = cumulativeNet >= 0 ? '#1e8e3e' : '#d93025';
-                            
-                            let statusIcon = groupTriggered ? '⏸️ (Executed Above)' : '⏳ Accumulating...';
+                            const cColor = displayAccumulation >= 0 ? '#1e8e3e' : '#d93025';
 
-                            // Check Targets
-                            if (!groupTriggered && targetV1 > 0 && cumulativeNet >= targetV1) {
-                                if (isTpEnabled) {
-                                    statusIcon = '🔥 EXECUTING (TP)!';
-                                    topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached & Executing Take Profit ($\${cumulativeNet.toFixed(4)})!</span>\`;
-                                    groupTriggered = true;
-                                } else {
-                                    statusIcon = '⏸️ TP Hit but Disabled';
-                                }
-                            } else if (!groupTriggered && stopLossV1 < 0 && cumulativeNet <= stopLossV1) {
-                                if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(cumulativeNet)) > maxLossPerMin) {
-                                    statusIcon = '🛑 BLOCKED (60s Limit)';
-                                    topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🛑 Stop Loss reached but Blocked by 60s Limit!</span>\`;
-                                } else {
-                                    statusIcon = '🔥 EXECUTING (SL)!';
-                                    topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit & Executing!</span>\`;
-                                    groupTriggered = true;
-                                }
-                            }
+                            let rowStyle = (i === peakRowIndex && peakAccumulation > 0) ? 'border: 2px solid #1e8e3e; background: #e6f4ea;' : '';
 
-                            // Default UI Message if nothing triggered
-                            if (!groupTriggered && i === totalPairs - 1) {
-                                topStatusMessage = \`TP Status: \${tpStatusText} | Current Accumulation: <strong style="color:\${cColor}">\${cumulativeNet >= 0 ? '+' : ''}$\${cumulativeNet.toFixed(4)}</strong>\`;
-                            }
-
-                            liveHtml += \`<tr>
+                            liveHtml += \`<tr style="\${rowStyle}">
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; color:#5f6368;">\${winnerIndex + 1} & \${loserIndex + 1} <br><span style="font-size:0.75em; color:#1a73e8">\${statusIcon}</span></td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500;">\${w.symbol}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${wColor}; font-weight:700;">\${w.pnl >= 0 ? '+' : ''}$\${w.pnl.toFixed(4)}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500;">\${l.symbol}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${lColor}; font-weight:700;">\${l.pnl >= 0 ? '+' : ''}$\${l.pnl.toFixed(4)}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${nColor}; font-weight:700; background: #f8f9fa;">\${net >= 0 ? '+' : ''}$\${net.toFixed(4)}</td>
-                                <td style="padding:12px; border-bottom:1px solid #eee; color:\${cColor}; font-weight:700; background: #e8f0fe;">\${cumulativeNet >= 0 ? '+' : ''}$\${cumulativeNet.toFixed(4)}</td>
+                                <td style="padding:12px; border-bottom:1px solid #eee; color:\${cColor}; font-weight:700; background: #e8f0fe;">\${displayAccumulation >= 0 ? '+' : ''}$\${displayAccumulation.toFixed(4)}</td>
                             </tr>\`;
                         }
                         liveHtml += '</table>';
