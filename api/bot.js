@@ -40,15 +40,6 @@ const CoinSettingSchema = new mongoose.Schema({
     botActive: { type: Boolean, default: false }
 });
 
-// NEW SCHEMA TO SAVE PAPER TRADING DATA
-const SimulatedPositionSchema = new mongoose.Schema({
-    symbol: { type: String, required: true },
-    side: { type: String, required: true },
-    contracts: { type: Number, required: true },
-    entryPrice: { type: Number, required: true },
-    contractSize: { type: Number, required: true }
-});
-
 const SubAccountSchema = new mongoose.Schema({
     name: { type: String, required: true },
     apiKey: { type: String, required: true },
@@ -62,8 +53,7 @@ const SubAccountSchema = new mongoose.Schema({
     dcaTargetRoiPct: { type: Number, default: -2.0 },
     maxContracts: { type: Number, default: 1000 },
     realizedPnl: { type: Number, default: 0 },
-    coins: [CoinSettingSchema],
-    simulatedPositions: [SimulatedPositionSchema] // PERMANENT STORAGE FOR PAPER TRADES
+    coins: [CoinSettingSchema]
 });
 
 const SettingsSchema = new mongoose.Schema({
@@ -134,79 +124,13 @@ function startBot(userId, subAccount) {
         enableRateLimit: true 
     });
     
-    // NOTE: INJECTED PAPER TRADING STATE (Loads from Database)
-    const state = { 
-        logs: [], 
-        coinStates: {}, 
-        simulatedPositions: subAccount.simulatedPositions || [], 
-        marketsLoaded: false 
-    };
+    const state = { logs: [], coinStates: {} };
     let isProcessing = false;
     let lastError = '';
-
-    // Helper to save paper trades to DB so they survive reboots
-    const syncPositionsToDB = () => {
-        subAccount.simulatedPositions = state.simulatedPositions;
-        Settings.updateOne(
-            { "subAccounts._id": subAccount._id },
-            { $set: { "subAccounts.$.simulatedPositions": state.simulatedPositions } }
-        ).catch(e => console.error("DB Sync Error for positions:", e));
-    };
-
-    // ==========================================
-    // PAPER TRADING OVERRIDES (MOCKS CCXT EXECUTION)
-    // ==========================================
-    exchange.fetchPositions = async (symbols) => {
-        return state.simulatedPositions.filter(p => symbols.includes(p.symbol));
-    };
-
-    exchange.createOrder = async (symbol, type, side, amount, price, params) => {
-        const isClose = params && params.offset === 'close';
-        const posSide = params && params.offset === 'open' ? (side === 'buy' ? 'long' : 'short') : (side === 'sell' ? 'long' : 'short');
-        
-        if (isClose) {
-            state.simulatedPositions = state.simulatedPositions.filter(p => p.symbol !== symbol);
-            syncPositionsToDB();
-            logForProfile(profileId, `[PAPER TRADE] Executed Virtual Close for ${symbol}`);
-        } else {
-            let pos = state.simulatedPositions.find(p => p.symbol === symbol);
-            const currentPrice = state.coinStates[symbol]?.currentPrice || 1; 
-            
-            // Apply REAL Contract Size from Exchange to fix PNL math
-            const market = exchange.markets ? exchange.markets[symbol] : null;
-            const realContractSize = market && market.contractSize ? market.contractSize : 1;
-
-            if (!pos) {
-                pos = { symbol, side: posSide, contracts: 0, entryPrice: currentPrice, contractSize: realContractSize };
-                state.simulatedPositions.push(pos);
-            }
-            const totalCost = (pos.contracts * pos.entryPrice) + (amount * currentPrice);
-            pos.contracts += amount;
-            pos.entryPrice = totalCost / pos.contracts;
-            syncPositionsToDB();
-            logForProfile(profileId, `[PAPER TRADE] Virtual Order: ${side} ${amount} ${symbol} @ ~${currentPrice} (Contract Multiplier: ${realContractSize})`);
-        }
-        return { id: 'sim_' + Date.now(), info: {} };
-    };
-
-    exchange.setLeverage = async () => ({});
-    // ==========================================
 
     const intervalId = setInterval(async () => {
         if (isProcessing) return; 
         isProcessing = true;
-
-        // LOAD REAL MARKET DATA FOR ACCURATE PAPER PNL
-        if (!state.marketsLoaded) {
-            try {
-                await exchange.loadMarkets();
-                state.marketsLoaded = true;
-                logForProfile(profileId, `📊 Loaded real market contract sizes for accurate Paper Trading PNL.`);
-            } catch(e) {
-                isProcessing = false;
-                return;
-            }
-        }
 
         const botData = activeBots.get(profileId);
         if (!botData) {
@@ -329,7 +253,7 @@ function startBot(userId, subAccount) {
     }, 3000);
 
     activeBots.set(profileId, { userId: String(userId), settings: subAccount, state, exchange, intervalId });
-    logForProfile(profileId, `🚀 Engine Started for: ${subAccount.name} (PAPER TRADING MODE)`);
+    logForProfile(profileId, `🚀 Engine Started for: ${subAccount.name}`);
 }
 
 function stopBot(profileId) {
@@ -629,11 +553,7 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
             sub.realizedPnl = 0; 
             if (sub._id) {
                 const existingSub = existingSettings.subAccounts.find(s => s._id.toString() === sub._id.toString());
-                if (existingSub) {
-                    sub.realizedPnl = existingSub.realizedPnl || 0;
-                    // PRESERVE PAPER TRADES WHEN SAVING SETTINGS
-                    sub.simulatedPositions = existingSub.simulatedPositions || []; 
-                }
+                if (existingSub) sub.realizedPnl = existingSub.realizedPnl || 0;
             }
         });
     }
@@ -700,24 +620,6 @@ app.get('/api/offsets', authMiddleware, async (req, res) => {
     res.json(records);
 });
 
-// PNL RESET ENDPOINT
-app.post('/api/reset-pnl', authMiddleware, async (req, res) => {
-    const { profileId } = req.body;
-    const settings = await Settings.findOne({ userId: req.userId });
-    if (settings && settings.subAccounts) {
-        settings.subAccounts.forEach(sub => {
-            if (!profileId || sub._id.toString() === profileId) {
-                sub.realizedPnl = 0;
-                if (activeBots.has(sub._id.toString())) {
-                    activeBots.get(sub._id.toString()).settings.realizedPnl = 0;
-                }
-            }
-        });
-        await Settings.updateOne({ userId: req.userId }, { $set: { subAccounts: settings.subAccounts } });
-    }
-    res.json({ success: true });
-});
-
 // ==========================================
 // 7. FRONTEND UI
 // ==========================================
@@ -728,7 +630,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>HTX Multi-User Bot (Paper Trading)</title>
+        <title>HTX Multi-User Bot (Vercel Build)</title>
         <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
             body { font-family: 'Roboto', sans-serif; background: #f4f6f8; color: #333; margin: 0; padding: 20px; }
@@ -781,7 +683,7 @@ app.get('/', (req, res) => {
         <!-- DASHBOARD VIEW -->
         <div id="dashboard-view" class="container">
             <div class="header">
-                <h1>HTX Trading Bot (Paper Trade)</h1>
+                <h1>HTX Trading Bot</h1>
                 <div style="display:flex; gap:12px;">
                     <button class="btn-blue" style="margin:0; width:auto; padding: 8px 16px;" onclick="switchTab('main')">Dashboard</button>
                     <button class="btn-logout" style="margin:0; width:auto;" onclick="switchTab('offsets')">Smart Offsets (Half)</button>
@@ -955,16 +857,8 @@ app.get('/', (req, res) => {
                         <h2>Live Profile Dashboard</h2>
                         <div class="status-box" style="background:#e8f0fe; border-color:#d2e3fc;">
                             <div class="flex-row" style="justify-content: space-between;">
-                                <div>
-                                    <span class="stat-label">Global Realized PNL</span>
-                                    <span class="val" id="globalPnl">0.00</span>
-                                    <button class="btn-blue" style="margin-top:8px; font-size: 0.75em; padding: 4px 8px; width: auto;" onclick="resetPnl('global')">Reset Global PNL</button>
-                                </div>
-                                <div>
-                                    <span class="stat-label">Current Profile PNL</span>
-                                    <span class="val" id="profilePnl">0.00</span>
-                                    <button class="btn-blue" style="margin-top:8px; font-size: 0.75em; padding: 4px 8px; width: auto;" onclick="resetPnl('profile')">Reset Profile PNL</button>
-                                </div>
+                                <div><span class="stat-label">Global Realized PNL</span><span class="val" id="globalPnl">0.00</span></div>
+                                <div><span class="stat-label">Current Profile PNL</span><span class="val" id="profilePnl">0.00</span></div>
                             </div>
                         </div>
                         
@@ -1244,22 +1138,6 @@ app.get('/', (req, res) => {
                 const coin = myCoins.find(c => c.symbol === symbol);
                 if(coin) coin.botActive = active;
                 await saveSettings(true); 
-            }
-
-            async function resetPnl(type) {
-                if (!confirm(\`Are you sure you want to reset \${type} PNL?\`)) return;
-                let profileId = null;
-                if (type === 'profile') {
-                    if (currentProfileIndex === -1) return alert("No profile loaded!");
-                    profileId = mySubAccounts[currentProfileIndex]._id;
-                }
-                await fetch('/api/reset-pnl', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-                    body: JSON.stringify({ profileId })
-                });
-                alert(type.toUpperCase() + ' PNL Reset Successfully!');
-                loadStatus(); 
             }
 
             async function loadOffsets() {
