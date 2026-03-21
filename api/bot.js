@@ -1,5 +1,3 @@
-//web8888
-
 const express = require('express');
 const ccxt = require('ccxt');
 const mongoose = require('mongoose');
@@ -160,10 +158,16 @@ function startBot(userId, subAccount) {
             for (let coin of activeCoins) {
                 try {
                     if (!state.coinStates[coin.symbol]) {
-                        state.coinStates[coin.symbol] = { status: 'Running', currentPrice: 0, avgEntry: 0, contracts: 0, currentRoi: 0, unrealizedPnl: 0, margin: 0, lastDcaTime: 0 };
+                        state.coinStates[coin.symbol] = { status: 'Running', currentPrice: 0, avgEntry: 0, contracts: 0, currentRoi: 0, unrealizedPnl: 0, margin: 0, lastDcaTime: 0, lockUntil: 0 };
                     }
 
                     let cState = state.coinStates[coin.symbol];
+                    
+                    // 🛑 COOLDOWN LOCK: Prevent fetching stale API data immediately after a close
+                    if (cState.lockUntil && Date.now() < cState.lockUntil) {
+                        continue;
+                    }
+
                     cState.status = 'Running';
 
                     const ticker = allTickers[coin.symbol];
@@ -180,6 +184,9 @@ function startBot(userId, subAccount) {
                         const safeBaseQty = Math.max(1, Math.floor(currentSettings.baseQty));
                         
                         logForProfile(profileId, `[${coin.symbol}] 🛒 No position. Opening base position of ${safeBaseQty} contracts (${activeSide}).`);
+                        
+                        cState.lockUntil = Date.now() + 8000; // Lock state while opening
+
                         await exchange.setLeverage(currentSettings.leverage, coin.symbol, { marginMode: 'cross' }).catch(()=>{});
                         const orderSide = activeSide === 'long' ? 'buy' : 'sell';
                         
@@ -209,16 +216,19 @@ function startBot(userId, subAccount) {
                         const reason = isTakeProfit ? '🎯 Take Profit' : '🛑 Stop Loss';
                         logForProfile(profileId, `[${coin.symbol}] ${reason} hit! (${cState.currentRoi.toFixed(2)}%). Closing ${cState.contracts} contracts.`);
                         
+                        // Optimistic memory lock
+                        const contractsToClose = cState.contracts;
+                        cState.lockUntil = Date.now() + 8000;
+                        cState.contracts = 0;
+                        cState.unrealizedPnl = 0;
+                        cState.currentRoi = 0;
+
                         const orderSide = activeSide === 'long' ? 'sell' : 'buy';
-                        await exchange.createOrder(coin.symbol, 'market', orderSide, cState.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: currentSettings.leverage }).catch(()=>{});
-                        await new Promise(res => setTimeout(res, 500)); 
+                        await exchange.createOrder(coin.symbol, 'market', orderSide, contractsToClose, undefined, { offset: 'close', reduceOnly: true, lever_rate: currentSettings.leverage }).catch(()=>{});
 
                         currentSettings.realizedPnl = (currentSettings.realizedPnl || 0) + unrealizedPnl;
                         Settings.updateOne({ "subAccounts._id": currentSettings._id }, { $set: { "subAccounts.$.realizedPnl": currentSettings.realizedPnl } }).catch(()=>{});
 
-                        cState.contracts = 0;
-                        cState.unrealizedPnl = 0;
-                        cState.currentRoi = 0;
                         continue; 
                     }
 
@@ -233,6 +243,8 @@ function startBot(userId, subAccount) {
                             cState.lastDcaTime = Date.now(); 
                         } else {
                             logForProfile(profileId, `[${coin.symbol}] ⚡ Executing DCA: Buying ${reqQty} contracts at ~${cState.currentPrice}`);
+                            
+                            cState.lockUntil = Date.now() + 8000; // Lock state while executing DCA
                             const orderSide = activeSide === 'long' ? 'buy' : 'sell';
                             await exchange.createOrder(coin.symbol, 'market', orderSide, reqQty, undefined, { offset: 'open', lever_rate: currentSettings.leverage }).catch(()=>{});
                             
@@ -271,7 +283,12 @@ function stopBot(profileId) {
 // =========================================================================
 // 5. GLOBAL PROFIT LOGIC (Manual Strict Mode)
 // =========================================================================
+let isGlobalMonitoring = false; // Prevents Global Loop double-execution overlaps
+
 setInterval(async () => {
+    if (isGlobalMonitoring) return;
+    isGlobalMonitoring = true;
+
     try {
         await connectDB(); 
         const usersSettings = await Settings.find({});
@@ -306,7 +323,9 @@ setInterval(async () => {
 
                 for (let symbol in botData.state.coinStates) {
                     const cState = botData.state.coinStates[symbol];
-                    if (cState.status === 'Running' && cState.contracts > 0) {
+                    
+                    // 🛑 Exclude locked coins (currently processing closures)
+                    if (cState.status === 'Running' && cState.contracts > 0 && (!cState.lockUntil || Date.now() >= cState.lockUntil)) {
                         const pnl = parseFloat(cState.unrealizedPnl) || 0;
                         globalUnrealized += pnl;
                         
@@ -344,10 +363,8 @@ setInterval(async () => {
                 let peakRowIndex = -1;
                 let fifthBottomAccumulation = 0;
 
-                // Index of the 5th row from the bottom (clamp to 0 if less than 5 pairs)
                 const targetRefIndex = Math.max(0, totalPairs - 5);
 
-                // 1. Calculate running accumulation and find the exact PEAK row
                 for (let i = 0; i < totalPairs; i++) {
                     const w = activeCandidates[i];
                     const l = activeCandidates[totalCoins - totalPairs + i];
@@ -360,13 +377,11 @@ setInterval(async () => {
                         peakRowIndex = i;
                     }
 
-                    // Capture the accumulation exactly at the 5th row from the bottom
                     if (i === targetRefIndex) {
                         fifthBottomAccumulation = runningAccumulation;
                     }
                 }
 
-                // Evaluate the 5th bottom row instead of the absolute bottom row
                 const isFifthBottomPositive = fifthBottomAccumulation > 0;
 
                 let triggerOffset = false;
@@ -374,8 +389,6 @@ setInterval(async () => {
                 let finalPairsToClose = [];
                 let finalNetProfit = 0;
 
-                // 2. Evaluate the Peak for Take Profit
-                // STRICT RULE: Only execute peak if the 5th Bottom Row > 0
                 if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0 && isFifthBottomPositive) {
                     triggerOffset = true;
                     reason = `TAKE PROFIT (Harvested Peak at Row ${peakRowIndex + 1}, Target: $${targetV1.toFixed(4)})`;
@@ -386,7 +399,6 @@ setInterval(async () => {
                         finalPairsToClose.push(activeCandidates[totalCoins - totalPairs + i]);
                     }
                 } 
-                // 3. Evaluate Stop Loss (Evaluates the total accumulation of ALL pairs)
                 else if (smartOffsetStopLoss < 0 && runningAccumulation <= stopLossV1) {
                     let allowSl = false;
                     if (smartOffsetMaxLossPerMinute > 0) {
@@ -408,7 +420,6 @@ setInterval(async () => {
                     }
                 }
 
-                // 4. EXECUTE CLOSE
                 if (triggerOffset) {
                     logForProfile(firstProfileId, `⚖️ SMART OFFSET V1 [${reason}]: Closing ${finalPairsToClose.length} coins total. NET PROFIT: ${finalNetProfit >= 0 ? '+' : ''}$${finalNetProfit.toFixed(4)}`);
                     
@@ -417,6 +428,14 @@ setInterval(async () => {
 
                     for (let k = 0; k < finalPairsToClose.length; k++) {
                         const pos = finalPairsToClose[k];
+                        const bState = activeBots.get(pos.profileId).state.coinStates[pos.symbol];
+                        
+                        // 🛑 Lock to prevent Ghost execution overlaps
+                        if (bState) {
+                            bState.lockUntil = Date.now() + 8000;
+                            bState.contracts = 0; 
+                        }
+
                         if (k % 2 === 0) totalWinnerPnl += pos.unrealizedPnl;
                         else totalLoserPnl += pos.unrealizedPnl;
 
@@ -425,7 +444,6 @@ setInterval(async () => {
                             await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage }).catch(()=>{});
                             pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                             await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
-                            activeBots.get(pos.profileId).state.coinStates[pos.symbol].contracts = 0;
                         } catch (e) {
                             logForProfile(pos.profileId, `❌ Failed Group Close on ${pos.symbol}: ${e.message}`);
                         }
@@ -459,8 +477,8 @@ setInterval(async () => {
                 const totalPairs = Math.floor(totalCoins / 2);
 
                 for (let i = 0; i < totalPairs; i++) {
-                    const winnerIndex = i; // Rank 1, 2, 3...
-                    const loserIndex = totalCoins - 1 - i; // Rank N, N-1, N-2...
+                    const winnerIndex = i; 
+                    const loserIndex = totalCoins - 1 - i; 
 
                     const biggestWinner = activeCandidates[winnerIndex];
                     const biggestLoser = activeCandidates[loserIndex];
@@ -489,7 +507,7 @@ setInterval(async () => {
                     }
                     
                     if (triggerOffset) {
-                        logForProfile(firstProfileId, `⚖️ SMART OFFSET V2 [${reason}]: Paired Rank ${winnerIndex + 1} & ${loserIndex + 1} - Closing Winner [${biggestWinner.symbol} (${biggestWinner.unrealizedPnl.toFixed(4)})] & Loser [${biggestLoser.symbol} (${biggestLoser.unrealizedPnl.toFixed(4)})]. NET PROFIT: ${netResult >= 0 ? '+' : ''}$${netResult.toFixed(4)}`);
+                        logForProfile(firstProfileId, `⚖️ SMART OFFSET V2 [${reason}]: Paired Rank ${winnerIndex + 1} & ${loserIndex + 1} - Closing Winner [${biggestWinner.symbol}] & Loser [${biggestLoser.symbol}]. NET: ${netResult >= 0 ? '+' : ''}$${netResult.toFixed(4)}`);
                         
                         OffsetRecord.create({
                             userId: dbUserId,
@@ -500,17 +518,22 @@ setInterval(async () => {
                             netProfit: netResult
                         }).catch(()=>{});
 
+                        // 🛑 Lock to prevent Ghost execution overlaps
+                        const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
+                        if(bStateW) { bStateW.lockUntil = Date.now() + 8000; bStateW.contracts = 0; }
+                        
+                        const bStateL = activeBots.get(biggestLoser.profileId).state.coinStates[biggestLoser.symbol];
+                        if(bStateL) { bStateL.lockUntil = Date.now() + 8000; bStateL.contracts = 0; }
+
                         const wOrderSide = biggestWinner.side === 'long' ? 'sell' : 'buy';
                         await biggestWinner.exchange.createOrder(biggestWinner.symbol, 'market', wOrderSide, biggestWinner.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: biggestWinner.leverage }).catch(()=>{});
                         biggestWinner.subAccount.realizedPnl = (biggestWinner.subAccount.realizedPnl || 0) + biggestWinner.unrealizedPnl;
                         await Settings.updateOne({ "subAccounts._id": biggestWinner.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": biggestWinner.subAccount.realizedPnl } }).catch(()=>{});
-                        activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol].contracts = 0;
 
                         const lOrderSide = biggestLoser.side === 'long' ? 'sell' : 'buy';
                         await biggestLoser.exchange.createOrder(biggestLoser.symbol, 'market', lOrderSide, biggestLoser.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: biggestLoser.leverage }).catch(()=>{});
                         biggestLoser.subAccount.realizedPnl = (biggestLoser.subAccount.realizedPnl || 0) + biggestLoser.unrealizedPnl;
                         await Settings.updateOne({ "subAccounts._id": biggestLoser.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": biggestLoser.subAccount.realizedPnl } }).catch(()=>{});
-                        activeBots.get(biggestLoser.profileId).state.coinStates[biggestLoser.symbol].contracts = 0;
                         
                         offsetExecuted2 = true;
                         if (netResult < 0 && smartOffsetMaxLossPerMinute > 0) {
@@ -549,17 +572,20 @@ setInterval(async () => {
                     
                     for (let pos of activeCandidates) {
                         try {
+                            const bData = activeBots.get(pos.profileId);
+                            // 🛑 Lock to prevent Ghost execution overlaps
+                            if (bData && bData.state.coinStates[pos.symbol]) {
+                                bData.state.coinStates[pos.symbol].lockUntil = Date.now() + 8000;
+                                bData.state.coinStates[pos.symbol].contracts = 0;
+                                bData.state.coinStates[pos.symbol].unrealizedPnl = 0;
+                            }
+
                             const orderSide = pos.side === 'long' ? 'sell' : 'buy';
                             await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage });
                             
                             pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                             await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
 
-                            const bData = activeBots.get(pos.profileId);
-                            if (bData && bData.state.coinStates[pos.symbol]) {
-                                bData.state.coinStates[pos.symbol].contracts = 0;
-                                bData.state.coinStates[pos.symbol].unrealizedPnl = 0;
-                            }
                         } catch(e) {
                             logForProfile(pos.profileId, `❌ Failed Global Close on ${pos.symbol}: ${e.message}`);
                         }
@@ -569,6 +595,8 @@ setInterval(async () => {
         }
     } catch (err) {
         console.error("Global Profit Monitor Error:", err);
+    } finally {
+        isGlobalMonitoring = false; // Release Global Loop lock
     }
 }, 4000); 
 
@@ -1313,7 +1341,9 @@ app.get('/', (req, res) => {
                     if (st && st.coinStates) {
                         for (let sym in st.coinStates) {
                             const cs = st.coinStates[sym];
-                            if (cs.status === 'Running' && cs.contracts > 0) {
+                            
+                            // 🛑 Filter locked coins locally on dashboard UI to match backend reality
+                            if (cs.status === 'Running' && cs.contracts > 0 && (!cs.lockUntil || Date.now() >= cs.lockUntil)) {
                                 totalTrading++;
                                 const pnlNum = parseFloat(cs.unrealizedPnl) || 0;
                                 if (cs.currentRoi > 0) totalAboveZero++;
@@ -1556,6 +1586,12 @@ app.get('/', (req, res) => {
                         let statusColor = state.status === 'Running' ? '#1e8e3e' : '#d93025';
                         let roiColorClass = state.currentRoi >= 0 ? 'val green' : 'val red';
                         const displaySide = coin.side || profile.side || 'long';
+
+                        // 🛑 UI Note for locked coins
+                        if (state.lockUntil && Date.now() < state.lockUntil) {
+                            statusColor = '#f29900';
+                            state.status = 'Closing / Locked';
+                        }
 
                         html += \`
                         <div class="status-box">
