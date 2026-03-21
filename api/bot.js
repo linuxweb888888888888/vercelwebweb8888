@@ -355,14 +355,17 @@ setInterval(async () => {
                     }
                 }
 
+                // runningAccumulation is now equal to the "Bottom Row" (total net of ALL pairs)
+                const bottomRowPositive = runningAccumulation > 0;
+
                 let triggerOffset = false;
                 let reason = '';
                 let finalPairsToClose = [];
                 let finalNetProfit = 0;
 
                 // 2. Evaluate the Peak for Take Profit
-                // Slices the group strictly at the peak if the peak is >= Target
-                if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0) {
+                // STRICT RULE: Only execute peak if the Bottom Row > 0
+                if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0 && bottomRowPositive) {
                     triggerOffset = true;
                     reason = `TAKE PROFIT (Harvested Peak at Row ${peakRowIndex + 1}, Target: $${targetV1.toFixed(4)})`;
                     finalNetProfit = peakAccumulation;
@@ -783,7 +786,7 @@ app.get('/', (req, res) => {
             <div id="offset-tab" style="display:none;">
                 <div class="panel">
                     <h2 style="color: #1a73e8;">Live Accumulation Grouping (Dynamic Peak Harvester)</h2>
-                    <p style="font-size:0.85em; color:#5f6368; margin-top:-8px; margin-bottom:16px;">This engine scans the "Group Accumulation" column to find the exact row where the profit hits its peak. If that peak reaches your Target, it chops the list right there and closes those profitable pairs, leaving the losers at the bottom to recover.</p>
+                    <p style="font-size:0.85em; color:#5f6368; margin-top:-8px; margin-bottom:16px;">This engine scans the "Group Accumulation" column to find the exact row where the profit hits its peak. If that peak reaches your Target AND the Bottom Row (overall sum) is positive, it chops the list right there and closes those profitable pairs.</p>
                     <div id="liveOffsetsContainer">Waiting for live data...</div>
                 </div>
                 
@@ -1347,19 +1350,26 @@ app.get('/', (req, res) => {
                             }
                         }
 
-                        let topStatusMessage = '<span style="color:#f29900;">⏳ Scanning for peak... Target not reached yet.</span>';
+                        // The "Bottom Row" is the final runningAccumulation
+                        const bottomRowPositive = runningAccumulation > 0;
+
+                        let topStatusMessage = '';
                         let executingPeak = false;
                         let executingSl = false;
 
                         if (targetV1 > 0 && peakAccumulation >= targetV1 && peakRowIndex >= 0) {
-                            topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)})!</span>\`;
-                            executingPeak = true;
+                            if (bottomRowPositive) {
+                                topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached & Bottom Row > 0! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)})!</span>\`;
+                                executingPeak = true;
+                            } else {
+                                topStatusMessage = \`TP Status: <span style="color:#d93025; font-weight:bold;">⏸️ Peak found (+\$\${peakAccumulation.toFixed(4)}) but Bottom Row is <= 0</span>\`;
+                            }
                         } else if (stopLossV1 < 0 && runningAccumulation <= stopLossV1) {
                             topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit for the whole group!</span>\`;
                             executingSl = true;
                         } else {
                             let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
-                            topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak Found: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
+                            topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)} (Requires Bottom Row > 0)</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
                         }
 
                         let displayAccumulation = 0;
