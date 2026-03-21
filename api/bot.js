@@ -356,7 +356,7 @@ setInterval(async () => {
                         allPairsInProfit = false;
                     }
 
-                    // Accumulate pairs into the bucket!
+                    // Accumulate pairs into the bucket
                     v1Bucket.push(biggestWinner);
                     v1Bucket.push(biggestLoser);
                     v1BucketNet += netResult;
@@ -1320,18 +1320,13 @@ app.get('/', (req, res) => {
                     if (totalPairs === 0) {
                         document.getElementById('liveOffsetsContainer').innerHTML = '<p style="color:#5f6368;">Not enough active trades to form pairs.</p>';
                     } else {
-                        let dynamicInfoHtml = \`<div style="margin-bottom: 12px; padding: 10px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 4px; color: #1a73e8; font-weight: 500;">
-                            <div style="margin-bottom: 4px;">🎯 Strict Take Profit: $\${targetV1.toFixed(4)}</div>
-                            <div>🛑 Strict Stop Loss: $\${stopLossV1.toFixed(4)}</div>
-                            \${lossTrackerHtml}
-                        </div>\`;
-
                         let liveHtml = '<table style="width:100%; text-align:left; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden;">';
                         liveHtml += '<tr style="background:#e8f0fe;"><th style="padding:12px; border-bottom:2px solid #dadce0;">Rank Pair</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Pair Net</th><th style="padding:12px; border-bottom:2px solid #dadce0; color:#1a73e8;">Group Accumulation</th></tr>';
 
                         let cumulativeNet = 0;
                         let groupTriggered = false;
-                        let allPairsInProfit = true; // NEW UI RULE
+                        let allPairsInProfit = true; 
+                        let topStatusMessage = '<span style="color:#f29900;">⏳ Accumulating pairs... Target not reached yet.</span>';
 
                         for (let i = 0; i < totalPairs; i++) {
                             const winnerIndex = i;
@@ -1343,7 +1338,6 @@ app.get('/', (req, res) => {
                             
                             if (net <= 0) allPairsInProfit = false; // Track if any pair is negative
 
-                            // Only add to bucket if we haven't already hit a target on an earlier pair
                             if (!groupTriggered) {
                                 cumulativeNet += net;
                             }
@@ -1353,25 +1347,26 @@ app.get('/', (req, res) => {
                             const nColor = net >= 0 ? '#1e8e3e' : '#d93025';
                             const cColor = cumulativeNet >= 0 ? '#1e8e3e' : '#d93025';
                             
-                            // Check strict conditions
-                            const isTargetHit = (!groupTriggered && targetV1 > 0 && cumulativeNet >= targetV1 && allPairsInProfit);
-                            const isStopHit = (!groupTriggered && stopLossV1 < 0 && cumulativeNet <= stopLossV1);
-                            
                             let statusIcon = groupTriggered ? '⏸️ (Group Executed Above)' : '⏳ Accumulating...';
                             
-                            if (isTargetHit) {
-                                statusIcon = '🔥 EXECUTING GROUP (TP)!';
-                                groupTriggered = true;
-                            } else if (isStopHit) {
+                            if (!groupTriggered && targetV1 > 0 && cumulativeNet >= targetV1) {
+                                if (allPairsInProfit) {
+                                    statusIcon = '🔥 EXECUTING GROUP (TP)!';
+                                    topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached & Executing TP ($\${cumulativeNet.toFixed(4)})!</span>\`;
+                                    groupTriggered = true;
+                                } else {
+                                    statusIcon = '⏸️ Waiting (A Pair Net is <= $0.00)';
+                                    topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⏸️ Target Reached ($\${cumulativeNet.toFixed(4)}), but waiting because Pair \${i + 1} Net is <= $0.00</span>\`;
+                                }
+                            } else if (!groupTriggered && stopLossV1 < 0 && cumulativeNet <= stopLossV1) {
                                 if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(cumulativeNet)) > maxLossPerMin) {
                                     statusIcon = '🛑 BLOCKED (Limit Reached)';
+                                    topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🛑 Stop Loss reached but Blocked by 60s Limit!</span>\`;
                                 } else {
                                     statusIcon = '🔥 EXECUTING GROUP (SL)!';
+                                    topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit & Executing!</span>\`;
                                     groupTriggered = true;
                                 }
-                            } else if (!groupTriggered && targetV1 > 0 && cumulativeNet >= targetV1 && !allPairsInProfit) {
-                                // Provides clear visual feedback if the amount hit the target but one pair is negative
-                                statusIcon = '⏸️ Waiting (A Pair Net is <= 0)';
                             }
 
                             liveHtml += \`<tr>
@@ -1386,6 +1381,17 @@ app.get('/', (req, res) => {
                         }
                         liveHtml += '</table>';
                         
+                        let dynamicInfoHtml = \`<div style="margin-bottom: 12px; padding: 12px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 6px; color: #1a73e8; font-weight: 500;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <div>🎯 Strict Take Profit: $\${targetV1.toFixed(4)}</div>
+                                <div>🛑 Strict Stop Loss: $\${stopLossV1.toFixed(4)}</div>
+                            </div>
+                            \${lossTrackerHtml}
+                            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed #b3d4ff; font-size: 1.1em;">
+                                Live Status: \${topStatusMessage}
+                            </div>
+                        </div>\`;
+
                         document.getElementById('liveOffsetsContainer').innerHTML = dynamicInfoHtml + liveHtml;
                     }
                 }
@@ -1402,14 +1408,10 @@ app.get('/', (req, res) => {
                     if (totalPairs === 0) {
                         document.getElementById('liveOffsetsContainer2').innerHTML = '<p style="color:#5f6368;">Not enough active trades to form pairs.</p>';
                     } else {
-                        let dynamicInfoHtml2 = \`<div style="margin-bottom: 12px; padding: 10px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 4px; color: #1a73e8; font-weight: 500;">
-                            <div style="margin-bottom: 4px;">🎯 Strict Take Profit V2: $\${targetV2.toFixed(4)}</div>
-                            <div>🛑 Strict Stop Loss V2: $\${stopLossV2.toFixed(4)}</div>
-                            \${lossTrackerHtml}
-                        </div>\`;
-
                         let liveHtml = '<table style="width:100%; text-align:left; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden;">';
                         liveHtml += '<tr style="background:#e8f0fe;"><th style="padding:12px; border-bottom:2px solid #dadce0;">Rank Pair</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Winner PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser Coin</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Loser PNL</th><th style="padding:12px; border-bottom:2px solid #dadce0;">Live Net Profit</th></tr>';
+
+                        let topStatusMessage2 = '<span style="color:#f29900;">⏳ Evaluating pairs... Target not reached yet.</span>';
 
                         for (let i = 0; i < totalPairs; i++) {
                             const winnerIndex = i;
@@ -1427,10 +1429,17 @@ app.get('/', (req, res) => {
                             const isStopHit = (stopLossV2 < 0 && net <= stopLossV2);
                             
                             let statusIcon = '⏳ Evaluating';
-                            if (isTargetHit) statusIcon = '🔥 Executing (TP)...';
-                            else if (isStopHit) {
-                                if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(net)) > maxLossPerMin) statusIcon = '🛑 BLOCKED (Limit Reached)';
-                                else statusIcon = '🔥 Executing (SL)...';
+                            if (isTargetHit) {
+                                statusIcon = '🔥 Executing (TP)...';
+                                topStatusMessage2 = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Executing Pair \${winnerIndex+1} & \${loserIndex+1} for TP!</span>\`;
+                            } else if (isStopHit) {
+                                if (maxLossPerMin > 0 && (currentMinuteLoss + Math.abs(net)) > maxLossPerMin) {
+                                    statusIcon = '🛑 BLOCKED (Limit)';
+                                    topStatusMessage2 = \`<span style="color:#d93025; font-weight:bold;">🛑 Stop Loss reached but Blocked by 60s Limit!</span>\`;
+                                } else {
+                                    statusIcon = '🔥 Executing (SL)...';
+                                    topStatusMessage2 = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit & Executing!</span>\`;
+                                }
                             }
 
                             liveHtml += \`<tr>
@@ -1450,6 +1459,18 @@ app.get('/', (req, res) => {
                             const mColor = mid.pnl >= 0 ? '#1e8e3e' : '#d93025';
                             liveHtml += \`<p style="font-size:0.85em; color:#5f6368; margin-top:12px;">Middle coin (Rank \${midIndex + 1}, Unpaired): <strong>\${mid.symbol}</strong> (<span style="color:\${mColor}">\${mid.pnl >= 0 ? '+' : ''}$\${mid.pnl.toFixed(4)}</span>)</p>\`;
                         }
+                        
+                        let dynamicInfoHtml2 = \`<div style="margin-bottom: 12px; padding: 12px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 6px; color: #1a73e8; font-weight: 500;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <div>🎯 Strict Take Profit V2: $\${targetV2.toFixed(4)}</div>
+                                <div>🛑 Strict Stop Loss V2: $\${stopLossV2.toFixed(4)}</div>
+                            </div>
+                            \${lossTrackerHtml}
+                            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed #b3d4ff; font-size: 1.1em;">
+                                Live Status: \${topStatusMessage2}
+                            </div>
+                        </div>\`;
+
                         document.getElementById('liveOffsetsContainer2').innerHTML = dynamicInfoHtml2 + liveHtml;
                     }
                 }
