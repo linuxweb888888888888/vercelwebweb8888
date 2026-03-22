@@ -296,8 +296,9 @@ const executeOneMinuteCloser = async () => {
         const usersSettings = await Settings.find({});
         for (let userSetting of usersSettings) {
             const dbUserId = String(userSetting.userId);
-            let rawMin = parseFloat(userSetting.minuteCloseMinPnl) || 0;
-            let rawMax = parseFloat(userSetting.minuteCloseMaxPnl) || 0;
+            // Treat user inputs as absolute magnitudes
+            let rawMin = Math.abs(parseFloat(userSetting.minuteCloseMinPnl) || 0);
+            let rawMax = Math.abs(parseFloat(userSetting.minuteCloseMaxPnl) || 0);
             const autoDynamic = userSetting.minuteCloseAutoDynamic || false;
             
             let activeCandidates = [];
@@ -337,9 +338,9 @@ const executeOneMinuteCloser = async () => {
                 if (peakRowIndex >= 0 && peakRowIndex + 1 < totalPairs) {
                     let val1 = activeCandidates[peakRowIndex].pnl;
                     let val2 = activeCandidates[peakRowIndex + 1].pnl;
-                    // Mirror positive peak to negative domain to act strictly as a stop loss
-                    rawMax = -Math.abs(Math.min(val1, val2));
-                    rawMin = -Math.abs(Math.max(val1, val2));
+                    // Mirror positive peak to exact magnitude boundaries
+                    rawMin = Math.min(Math.abs(val1), Math.abs(val2));
+                    rawMax = Math.max(Math.abs(val1), Math.abs(val2));
                 } else {
                     rawMin = 0; rawMax = 0;
                 }
@@ -351,20 +352,20 @@ const executeOneMinuteCloser = async () => {
                 }
             }
 
-            if (!autoDynamic) {
-                if (rawMin > 0) rawMin = -rawMin;
-                if (rawMax > 0) rawMax = -rawMax;
-            }
-
             if (rawMin === 0 && rawMax === 0) continue; 
 
-            const actualMin = Math.min(rawMin, rawMax);
-            const actualMax = Math.max(rawMin, rawMax);
+            // Create guaranteed absolute range boundaries
+            const absMin = Math.min(rawMin, rawMax);
+            const absMax = Math.max(rawMin, rawMax);
 
             for (let pos of activeCandidates) {
-                // Strictly enforce negative Stop Loss (pnl < 0)
-                if (pos.pnl < 0 && pos.pnl >= actualMin && pos.pnl <= actualMax) {
-                    logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Range Stop Loss: PNL $${pos.pnl.toFixed(4)} is in negative boundary. Closing position.`);
+                // Mirrored conditions: Allow both positive (Take Profit) and negative (Stop Loss)
+                const isPositiveMatch = pos.pnl > 0 && pos.pnl >= absMin && pos.pnl <= absMax;
+                const isNegativeMatch = pos.pnl < 0 && pos.pnl <= -absMin && pos.pnl >= -absMax;
+
+                if (isPositiveMatch || isNegativeMatch) {
+                    const sideStr = isPositiveMatch ? "Positive (Take Profit)" : "Negative (Stop Loss)";
+                    logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Mirrored Closer: PNL $${pos.pnl.toFixed(4)} matches the ${sideStr} boundary. Closing position.`);
                     
                     pos.cState.lockUntil = Date.now() + 10000;
                     const contractsToClose = pos.contracts;
@@ -383,7 +384,7 @@ const executeOneMinuteCloser = async () => {
             }
         }
     } catch (err) {
-        console.error("1-Min Range Closer Error:", err);
+        console.error("1-Min Mirrored Closer Error:", err);
     }
 };
 
@@ -746,11 +747,9 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
     let parsedStopLoss2 = parseFloat(smartOffsetStopLoss2) || 0;
     if (parsedStopLoss2 > 0) parsedStopLoss2 = -parsedStopLoss2; 
 
-    // Force minute bounds to be negative so it always acts as a Stop Loss
-    let parsedMinPnl = parseFloat(minuteCloseMinPnl) || 0;
-    if (parsedMinPnl > 0) parsedMinPnl = -parsedMinPnl;
-    let parsedMaxPnl = parseFloat(minuteCloseMaxPnl) || 0;
-    if (parsedMaxPnl > 0) parsedMaxPnl = -parsedMaxPnl;
+    // Minute Bounds are now absolute positive values (Mirrored Closer)
+    let parsedMinPnl = Math.abs(parseFloat(minuteCloseMinPnl) || 0);
+    let parsedMaxPnl = Math.abs(parseFloat(minuteCloseMaxPnl) || 0);
 
     const updated = await Settings.findOneAndUpdate(
         { userId: req.userId }, 
@@ -1002,13 +1001,13 @@ app.get('/', (req, res) => {
 
                             <div style="margin-top: 12px; border-top: 1px solid #cce0ff; padding-top: 12px;">
                                 <label style="margin-top:0; display:flex; align-items:center;">
-                                    1-Min Dynamic Negative Stop-Loss (Close PNL Range)
+                                    1-Min Auto-Dynamic Mirrored Closer (TP & SL Range)
                                     <input type="checkbox" id="minuteCloseAutoDynamic" style="width:auto; margin-left:12px; margin-right:4px;"> Auto-Dynamic
                                 </label>
-                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Acts strictly as a Negative Stop Loss. Auto-Dynamic finds the positive peak inflection and mirrors it to the negative side to cut equivalent losers.</p>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Acts as a Mirrored Closer. Auto-Dynamic finds the positive peak inflection point and creates a boundary to cut those exact winners AND mirrors it to the negative side to cut equivalent losers.</p>
                                 <div class="flex-row">
-                                    <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseMinPnl" placeholder="Min PNL (e.g. -0.0004)"></div>
-                                    <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseMaxPnl" placeholder="Max PNL (e.g. -0.0001)"></div>
+                                    <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseMinPnl" placeholder="Min PNL Range (e.g. 0.0001)"></div>
+                                    <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseMaxPnl" placeholder="Max PNL Range (e.g. 0.0004)"></div>
                                 </div>
                             </div>
                             <button class="btn-blue" style="margin-top:16px;" onclick="saveGlobalSettings()">Save Global Settings</button>
@@ -1242,14 +1241,9 @@ app.get('/', (req, res) => {
                 mySmartOffsetMaxLossTimeframeSeconds = parseInt(document.getElementById('smartOffsetMaxLossTimeframeSeconds').value) || 60;
                 myMinuteCloseAutoDynamic = document.getElementById('minuteCloseAutoDynamic').checked;
                 
-                // Force to negative
-                let pMin = parseFloat(document.getElementById('minuteCloseMinPnl').value) || 0;
-                if (pMin > 0) pMin = -pMin;
-                myMinuteCloseMinPnl = pMin;
-
-                let pMax = parseFloat(document.getElementById('minuteCloseMaxPnl').value) || 0;
-                if (pMax > 0) pMax = -pMax;
-                myMinuteCloseMaxPnl = pMax;
+                // Absolute Positive Magnitudes
+                myMinuteCloseMinPnl = Math.abs(parseFloat(document.getElementById('minuteCloseMinPnl').value) || 0);
+                myMinuteCloseMaxPnl = Math.abs(parseFloat(document.getElementById('minuteCloseMaxPnl').value) || 0);
                 
                 const data = { subAccounts: mySubAccounts, globalTargetPnl: myGlobalTargetPnl, globalTrailingPnl: myGlobalTrailingPnl, smartOffsetNetProfit: mySmartOffsetNetProfit, smartOffsetBottomRowV1: mySmartOffsetBottomRowV1, smartOffsetBottomRowV1StopLoss: mySmartOffsetBottomRowV1StopLoss, smartOffsetStopLoss: mySmartOffsetStopLoss, smartOffsetNetProfit2: mySmartOffsetNetProfit2, smartOffsetStopLoss2: mySmartOffsetStopLoss2, smartOffsetMaxLossPerMinute: mySmartOffsetMaxLossPerMinute, smartOffsetMaxLossTimeframeSeconds: mySmartOffsetMaxLossTimeframeSeconds, minuteCloseAutoDynamic: myMinuteCloseAutoDynamic, minuteCloseMinPnl: myMinuteCloseMinPnl, minuteCloseMaxPnl: myMinuteCloseMaxPnl };
                 await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data) });
@@ -1514,8 +1508,8 @@ app.get('/', (req, res) => {
                     if (pIdx >= 0 && pIdx + 1 < tPairs) {
                         let val1 = sortedCands[pIdx].pnl;
                         let val2 = sortedCands[pIdx + 1].pnl;
-                        dynamicMax = -Math.abs(Math.min(val1, val2));
-                        dynamicMin = -Math.abs(Math.max(val1, val2));
+                        dynamicMax = Math.abs(Math.max(val1, val2));
+                        dynamicMin = Math.abs(Math.min(val1, val2));
                         hasDynamicBoundary = true;
                     }
                 }
