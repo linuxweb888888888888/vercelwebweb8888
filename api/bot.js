@@ -1,6 +1,3 @@
-//web8888
-//web8888
-
 const express = require('express');
 const ccxt = require('ccxt');
 const mongoose = require('mongoose');
@@ -15,27 +12,39 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_change_this_i
 const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
 
 // ==========================================
-// 1. MONGODB DATABASE SETUP (Serverless Safe)
+// 1. MONGODB DATABASE SETUP (Vercel Serverless Safe)
 // ==========================================
-let isConnected = false;
+let cachedDb = global.mongoose;
+if (!cachedDb) {
+    cachedDb = global.mongoose = { conn: null, promise: null };
+}
 
 const connectDB = async () => {
-    if (isConnected) return;
-    try {
-        const db = await mongoose.connect(MONGO_URI);
-        isConnected = db.connections[0].readyState === 1;
-        console.log('✅ Connected to MongoDB successfully!');
-    } catch (err) {
-        console.error('❌ MongoDB Connection Error:', err);
+    if (cachedDb.conn) return cachedDb.conn;
+    if (!cachedDb.promise) {
+        cachedDb.promise = mongoose.connect(MONGO_URI, { 
+            bufferCommands: false,
+            maxPoolSize: 10 
+        }).then((mongoose) => {
+            console.log('✅ Connected to MongoDB successfully (Serverless Cached)!');
+            return mongoose;
+        }).catch(err => {
+            console.error('❌ MongoDB Connection Error:', err);
+            cachedDb.promise = null; 
+        });
     }
+    cachedDb.conn = await cachedDb.promise;
+    return cachedDb.conn;
 };
-connectDB();
 
+// ==========================================
+// 2. MONGOOSE SCHEMAS
+// ==========================================
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true }
 });
-const User = mongoose.model('User', UserSchema);
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
 const CoinSettingSchema = new mongoose.Schema({
     symbol: { type: String, required: true },
@@ -64,8 +73,8 @@ const SettingsSchema = new mongoose.Schema({
     globalTargetPnl: { type: Number, default: 0 },       
     globalTrailingPnl: { type: Number, default: 0 },     
     smartOffsetNetProfit: { type: Number, default: 0 },
-    smartOffsetBottomRowV1: { type: Number, default: 5 }, // Nth row from bottom
-    smartOffsetBottomRowV1StopLoss: { type: Number, default: 0 }, // NEW: Nth Row Stop Loss
+    smartOffsetBottomRowV1: { type: Number, default: 5 }, 
+    smartOffsetBottomRowV1StopLoss: { type: Number, default: 0 }, 
     smartOffsetStopLoss: { type: Number, default: 0 },
     smartOffsetNetProfit2: { type: Number, default: 0 }, 
     smartOffsetStopLoss2: { type: Number, default: 0 },   
@@ -76,7 +85,7 @@ const SettingsSchema = new mongoose.Schema({
     minuteCloseMaxPnl: { type: Number, default: 0 },
     subAccounts: [SubAccountSchema]
 });
-const Settings = mongoose.model('Settings', SettingsSchema);
+const Settings = mongoose.models.Settings || mongoose.model('Settings', SettingsSchema);
 
 const OffsetRecordSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -87,15 +96,21 @@ const OffsetRecordSchema = new mongoose.Schema({
     netProfit: { type: Number, required: true },
     timestamp: { type: Date, default: Date.now }
 });
-const OffsetRecord = mongoose.model('OffsetRecord', OffsetRecordSchema);
+const OffsetRecord = mongoose.models.OffsetRecord || mongoose.model('OffsetRecord', OffsetRecordSchema);
 
 // ==========================================
-// 2. MULTI-PROFILE BOT ENGINE STATE
+// 3. MULTI-PROFILE BOT ENGINE STATE (Vercel Cached)
 // ==========================================
-const activeBots = new Map();
-const globalPnlPeaks = new Map(); 
-const lastStopLossExecutions = new Map(); 
-const rollingStopLosses = new Map(); 
+// Attach states to global so Vercel doesn't wipe them on hot-reloads
+global.activeBots = global.activeBots || new Map();
+global.globalPnlPeaks = global.globalPnlPeaks || new Map(); 
+global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
+global.rollingStopLosses = global.rollingStopLosses || new Map(); 
+
+const activeBots = global.activeBots;
+const globalPnlPeaks = global.globalPnlPeaks;
+const lastStopLossExecutions = global.lastStopLossExecutions;
+const rollingStopLosses = global.rollingStopLosses;
 
 function logForProfile(profileId, msg) {
     console.log(`[Profile: ${profileId}] ${msg}`);
@@ -109,7 +124,6 @@ function logForProfile(profileId, msg) {
 function calculateDcaQty(side, P0, Pc, C0, leverage, targetRoiPct) {
     const R = targetRoiPct / 100;
     let Pnew, Cn;
-
     if (side === 'long') {
         Pnew = Pc / (1 + (R / leverage));
         Cn = C0 * (P0 - Pnew) / (Pnew - Pc);
@@ -117,7 +131,6 @@ function calculateDcaQty(side, P0, Pc, C0, leverage, targetRoiPct) {
         Pnew = Pc / (1 - (R / leverage));
         Cn = C0 * (Pnew - P0) / (Pc - Pnew);
     }
-
     if (Cn <= 0 || isNaN(Cn) || !isFinite(Cn)) return 0;
     return Math.ceil(Cn); 
 }
@@ -171,11 +184,7 @@ function startBot(userId, subAccount) {
                     }
 
                     let cState = state.coinStates[coin.symbol];
-                    
-                    // 🛑 COOLDOWN LOCK: Prevent fetching stale API data immediately after a close
-                    if (cState.lockUntil && Date.now() < cState.lockUntil) {
-                        continue;
-                    }
+                    if (cState.lockUntil && Date.now() < cState.lockUntil) continue;
 
                     cState.status = 'Running';
 
@@ -193,12 +202,9 @@ function startBot(userId, subAccount) {
                         const safeBaseQty = Math.max(1, Math.floor(currentSettings.baseQty));
                         
                         logForProfile(profileId, `[${coin.symbol}] 🛒 No position. Opening base position of ${safeBaseQty} contracts (${activeSide}).`);
-                        
-                        cState.lockUntil = Date.now() + 8000; // Lock state while opening
-
+                        cState.lockUntil = Date.now() + 8000; 
                         await exchange.setLeverage(currentSettings.leverage, coin.symbol, { marginMode: 'cross' }).catch(()=>{});
                         const orderSide = activeSide === 'long' ? 'buy' : 'sell';
-                        
                         await exchange.createOrder(coin.symbol, 'market', orderSide, safeBaseQty, undefined, { offset: 'open', lever_rate: currentSettings.leverage });
                         continue; 
                     }
@@ -217,7 +223,7 @@ function startBot(userId, subAccount) {
                     cState.margin = margin;
                     cState.currentRoi = margin > 0 ? (unrealizedPnl / margin) * 100 : 0;
 
-                    // STANDARD SINGLE-COIN TP / SL
+                    // TP / SL
                     const isTakeProfit = cState.currentRoi >= currentSettings.takeProfitPct;
                     const isStopLoss = cState.currentRoi <= currentSettings.stopLossPct;
 
@@ -225,19 +231,15 @@ function startBot(userId, subAccount) {
                         const reason = isTakeProfit ? '🎯 Take Profit' : '🛑 Stop Loss';
                         logForProfile(profileId, `[${coin.symbol}] ${reason} hit! (${cState.currentRoi.toFixed(2)}%). Closing ${cState.contracts} contracts.`);
                         
-                        // Optimistic memory lock
                         const contractsToClose = cState.contracts;
                         cState.lockUntil = Date.now() + 8000;
-                        cState.contracts = 0;
-                        cState.unrealizedPnl = 0;
-                        cState.currentRoi = 0;
+                        cState.contracts = 0; cState.unrealizedPnl = 0; cState.currentRoi = 0;
 
                         const orderSide = activeSide === 'long' ? 'sell' : 'buy';
                         await exchange.createOrder(coin.symbol, 'market', orderSide, contractsToClose, undefined, { offset: 'close', reduceOnly: true, lever_rate: currentSettings.leverage }).catch(()=>{});
 
                         currentSettings.realizedPnl = (currentSettings.realizedPnl || 0) + unrealizedPnl;
                         Settings.updateOne({ "subAccounts._id": currentSettings._id }, { $set: { "subAccounts.$.realizedPnl": currentSettings.realizedPnl } }).catch(()=>{});
-
                         continue; 
                     }
 
@@ -252,15 +254,12 @@ function startBot(userId, subAccount) {
                             cState.lastDcaTime = Date.now(); 
                         } else {
                             logForProfile(profileId, `[${coin.symbol}] ⚡ Executing DCA: Buying ${reqQty} contracts at ~${cState.currentPrice}`);
-                            
-                            cState.lockUntil = Date.now() + 8000; // Lock state while executing DCA
+                            cState.lockUntil = Date.now() + 8000; 
                             const orderSide = activeSide === 'long' ? 'buy' : 'sell';
                             await exchange.createOrder(coin.symbol, 'market', orderSide, reqQty, undefined, { offset: 'open', lever_rate: currentSettings.leverage }).catch(()=>{});
-                            
                             cState.lastDcaTime = Date.now(); 
                         }
                     }
-
                 } catch (coinErr) {
                     if (coinErr.message !== lastError) logForProfile(profileId, `[${coin.symbol}] ❌ Warning: ${coinErr.message}`);
                 }
@@ -290,9 +289,9 @@ function stopBot(profileId) {
 }
 
 // =========================================================================
-// 4.5. 1-MINUTE RANGE POSITION CLOSER
+// 4. BACKGROUND TASKS (Protected Singleton for Vercel)
 // =========================================================================
-setInterval(async () => {
+const executeOneMinuteCloser = async () => {
     try {
         await connectDB();
         const usersSettings = await Settings.find({});
@@ -302,7 +301,6 @@ setInterval(async () => {
             let rawMax = parseFloat(userSetting.minuteCloseMaxPnl) || 0;
             const autoDynamic = userSetting.minuteCloseAutoDynamic || false;
             
-            // Gather all positions first so we can calculate the peak boundary dynamically
             let activeCandidates = [];
             for (let [profileId, botData] of activeBots.entries()) {
                 if (botData.userId !== dbUserId) continue;
@@ -344,7 +342,6 @@ setInterval(async () => {
                     rawMin = 0; rawMax = 0;
                 }
 
-                // If Auto-Dynamic calculates identical values (or 0), fallback to 0.0006 and 0.0004
                 if (rawMin === rawMax) {
                     rawMax = 0.0006;
                     rawMin = 0.0004;
@@ -359,7 +356,7 @@ setInterval(async () => {
 
             for (let pos of activeCandidates) {
                 if (pos.pnl >= actualMin && pos.pnl <= actualMax) {
-                    logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Range Closer: PNL $${pos.pnl.toFixed(4)} is in boundary ($${actualMin.toFixed(4)} to $${actualMax.toFixed(4)}). Closing position.`);
+                    logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Range Closer: PNL $${pos.pnl.toFixed(4)} is in boundary. Closing position.`);
                     
                     pos.cState.lockUntil = Date.now() + 8000;
                     const contractsToClose = pos.contracts;
@@ -380,16 +377,11 @@ setInterval(async () => {
     } catch (err) {
         console.error("1-Min Range Closer Error:", err);
     }
-}, 60000);
+};
 
-// =========================================================================
-// 5. GLOBAL PROFIT LOGIC (Manual Strict Mode)
-// =========================================================================
-let isGlobalMonitoring = false; // Prevents Global Loop double-execution overlaps
-
-setInterval(async () => {
-    if (isGlobalMonitoring) return;
-    isGlobalMonitoring = true;
+const executeGlobalProfitMonitor = async () => {
+    if (global.isGlobalMonitoring) return;
+    global.isGlobalMonitoring = true;
 
     try {
         await connectDB(); 
@@ -402,12 +394,11 @@ setInterval(async () => {
             const globalTrailingPnl = parseFloat(userSetting.globalTrailingPnl) || 0;
             const smartOffsetNetProfit = parseFloat(userSetting.smartOffsetNetProfit) || 0;
             const smartOffsetBottomRowV1 = parseInt(userSetting.smartOffsetBottomRowV1) || 5;
-            const smartOffsetBottomRowV1StopLoss = parseFloat(userSetting.smartOffsetBottomRowV1StopLoss) || 0; // NEW FIELD
+            const smartOffsetBottomRowV1StopLoss = parseFloat(userSetting.smartOffsetBottomRowV1StopLoss) || 0; 
             const smartOffsetStopLoss = parseFloat(userSetting.smartOffsetStopLoss) || 0;
             const smartOffsetNetProfit2 = parseFloat(userSetting.smartOffsetNetProfit2) || 0;
             const smartOffsetStopLoss2 = parseFloat(userSetting.smartOffsetStopLoss2) || 0;
             
-            // DYNAMIC TIMEFRAME VARIABLES
             const smartOffsetMaxLossPerMinute = parseFloat(userSetting.smartOffsetMaxLossPerMinute) || 0;
             const smartOffsetMaxLossTimeframeSeconds = parseInt(userSetting.smartOffsetMaxLossTimeframeSeconds) || 60;
             const timeframeMs = smartOffsetMaxLossTimeframeSeconds * 1000;
@@ -415,9 +406,7 @@ setInterval(async () => {
             let globalUnrealized = 0;
             let activeCandidates = [];
             let firstProfileId = null; 
-            let totalAllCoinsUser = 0;
 
-            // Rolling Loss Tracker logic using customized timeframe
             let rollingLossArr = rollingStopLosses.get(dbUserId) || [];
             rollingLossArr = rollingLossArr.filter(record => Date.now() - record.time < timeframeMs);
             rollingStopLosses.set(dbUserId, rollingLossArr);
@@ -427,12 +416,8 @@ setInterval(async () => {
                 if (botData.userId !== dbUserId) continue;
                 if (!firstProfileId) firstProfileId = profileId;
                 
-                totalAllCoinsUser += botData.settings.coins.filter(c => c.botActive).length;
-
                 for (let symbol in botData.state.coinStates) {
                     const cState = botData.state.coinStates[symbol];
-                    
-                    // 🛑 Exclude locked coins (currently processing closures)
                     if (cState.status === 'Running' && cState.contracts > 0 && (!cState.lockUntil || Date.now() >= cState.lockUntil)) {
                         const pnl = parseFloat(cState.unrealizedPnl) || 0;
                         globalUnrealized += pnl;
@@ -449,18 +434,15 @@ setInterval(async () => {
             if (!firstProfileId || activeCandidates.length === 0) continue;
 
             const totalCoinsTrading = activeCandidates.length;
-
             const targetV1 = smartOffsetNetProfit > 0 ? smartOffsetNetProfit : 0;
             const stopLossV1 = smartOffsetStopLoss < 0 ? smartOffsetStopLoss : 0;
-            const stopLossNth = smartOffsetBottomRowV1StopLoss < 0 ? smartOffsetBottomRowV1StopLoss : 0; // NEW
+            const stopLossNth = smartOffsetBottomRowV1StopLoss < 0 ? smartOffsetBottomRowV1StopLoss : 0; 
             const targetV2 = smartOffsetNetProfit2 > 0 ? smartOffsetNetProfit2 : 0;
             const stopLossV2 = smartOffsetStopLoss2 < 0 ? smartOffsetStopLoss2 : 0;
 
             let offsetExecuted = false;
 
-            // ====================================================
-            // SMART OFFSET V1 (DYNAMIC PEAK HARVESTING)
-            // ====================================================
+            // SMART OFFSET V1
             if ((smartOffsetNetProfit > 0 || smartOffsetStopLoss < 0 || smartOffsetBottomRowV1StopLoss < 0) && activeCandidates.length >= 2) {
                 activeCandidates.sort((a, b) => b.unrealizedPnl - a.unrealizedPnl); 
                 
@@ -485,10 +467,7 @@ setInterval(async () => {
                         peakAccumulation = runningAccumulation;
                         peakRowIndex = i;
                     }
-
-                    if (i === targetRefIndex) {
-                        nthBottomAccumulation = runningAccumulation;
-                    }
+                    if (i === targetRefIndex) nthBottomAccumulation = runningAccumulation;
                 }
 
                 let triggerOffset = false;
@@ -496,12 +475,10 @@ setInterval(async () => {
                 let finalPairsToClose = [];
                 let finalNetProfit = 0;
 
-                // Take Profit triggered immediately when Peak is found without Nth Row requirement
                 if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0) {
                     triggerOffset = true;
                     reason = `TAKE PROFIT (Harvested Peak at Row ${peakRowIndex + 1}, Target: $${targetV1.toFixed(4)})`;
                     finalNetProfit = peakAccumulation;
-                    
                     for(let i = 0; i <= peakRowIndex; i++) {
                         finalPairsToClose.push(activeCandidates[i]);
                         finalPairsToClose.push(activeCandidates[totalCoins - totalPairs + i]);
@@ -509,8 +486,6 @@ setInterval(async () => {
                 } 
                 else if ((stopLossNth < 0 && nthBottomAccumulation <= stopLossNth) || (stopLossV1 < 0 && runningAccumulation <= stopLossV1)) {
                     let allowSl = false;
-                    
-                    // We check rate limits against the total realized loss of the group since we close the whole group
                     let projectedLoss = runningAccumulation;
 
                     if (smartOffsetMaxLossPerMinute > 0) {
@@ -521,14 +496,13 @@ setInterval(async () => {
 
                     if (allowSl) {
                         triggerOffset = true;
-                        
                         if (stopLossNth < 0 && nthBottomAccumulation <= stopLossNth) {
                             reason = `STOP LOSS (Nth Row [${smartOffsetBottomRowV1}] hit limit: $${stopLossNth.toFixed(4)})`;
                         } else {
                             reason = `STOP LOSS (Full Group limit hit: $${stopLossV1.toFixed(4)})`;
                         }
 
-                        finalNetProfit = runningAccumulation; // Closing all realizes the running accumulation
+                        finalNetProfit = runningAccumulation; 
                         if(smartOffsetMaxLossPerMinute <= 0) lastStopLossExecutions.set(dbUserId, Date.now());
 
                         for(let i = 0; i < totalPairs; i++) {
@@ -548,12 +522,7 @@ setInterval(async () => {
                         const pos = finalPairsToClose[k];
                         const bState = activeBots.get(pos.profileId).state.coinStates[pos.symbol];
                         
-                        // 🛑 Lock to prevent Ghost execution overlaps
-                        if (bState) {
-                            bState.lockUntil = Date.now() + 8000;
-                            bState.contracts = 0; 
-                        }
-
+                        if (bState) { bState.lockUntil = Date.now() + 8000; bState.contracts = 0; }
                         if (k % 2 === 0) totalWinnerPnl += pos.unrealizedPnl;
                         else totalLoserPnl += pos.unrealizedPnl;
 
@@ -562,18 +531,12 @@ setInterval(async () => {
                             await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage }).catch(()=>{});
                             pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                             await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
-                        } catch (e) {
-                            logForProfile(pos.profileId, `❌ Failed Group Close on ${pos.symbol}: ${e.message}`);
-                        }
+                        } catch (e) {}
                     }
 
                     OffsetRecord.create({
-                        userId: dbUserId,
-                        winnerSymbol: `Peak of ${finalPairsToClose.length/2} Winners`,
-                        winnerPnl: totalWinnerPnl,
-                        loserSymbol: `Peak of ${finalPairsToClose.length/2} Losers`,
-                        loserPnl: totalLoserPnl,
-                        netProfit: finalNetProfit
+                        userId: dbUserId, winnerSymbol: `Peak of ${finalPairsToClose.length/2} Winners`, winnerPnl: totalWinnerPnl,
+                        loserSymbol: `Peak of ${finalPairsToClose.length/2} Losers`, loserPnl: totalLoserPnl, netProfit: finalNetProfit
                     }).catch(()=>{});
 
                     offsetExecuted = true;
@@ -581,14 +544,11 @@ setInterval(async () => {
                         currentMinuteLoss += Math.abs(finalNetProfit);
                         rollingLossArr.push({ time: Date.now(), amount: Math.abs(finalNetProfit) });
                     }
-                    
                     break;
                 }
             }
 
-            // ====================================================
-            // SMART OFFSET V2 (STRICT 1-to-1 ENDS / OUTSIDE-IN)
-            // ====================================================
+            // SMART OFFSET V2
             if (!offsetExecuted && (smartOffsetNetProfit2 > 0 || smartOffsetStopLoss2 < 0) && activeCandidates.length >= 2) {
                 let offsetExecuted2 = false;
                 const totalCoins = activeCandidates.length;
@@ -600,25 +560,21 @@ setInterval(async () => {
 
                     const biggestWinner = activeCandidates[winnerIndex];
                     const biggestLoser = activeCandidates[loserIndex];
-
                     const netResult = biggestWinner.unrealizedPnl + biggestLoser.unrealizedPnl;
                     
                     let triggerOffset = false;
                     let reason = '';
 
                     if (smartOffsetNetProfit2 > 0 && netResult >= targetV2) {
-                        triggerOffset = true;
-                        reason = `TAKE PROFIT V2 (Target: $${targetV2.toFixed(4)})`;
+                        triggerOffset = true; reason = `TAKE PROFIT V2 (Target: $${targetV2.toFixed(4)})`;
                     } else if (smartOffsetStopLoss2 < 0 && netResult <= stopLossV2) {
                         if (smartOffsetMaxLossPerMinute > 0) {
                             if (currentMinuteLoss + Math.abs(netResult) <= smartOffsetMaxLossPerMinute) {
-                                triggerOffset = true;
-                                reason = `STOP LOSS V2 (Target: $${stopLossV2.toFixed(4)})`;
+                                triggerOffset = true; reason = `STOP LOSS V2 (Target: $${stopLossV2.toFixed(4)})`;
                             }
                         } else {
                             if (Date.now() - (lastStopLossExecutions.get(dbUserId) || 0) >= timeframeMs) {
-                                triggerOffset = true;
-                                reason = `STOP LOSS V2 (Target: $${stopLossV2.toFixed(4)})`;
+                                triggerOffset = true; reason = `STOP LOSS V2 (Target: $${stopLossV2.toFixed(4)})`;
                                 lastStopLossExecutions.set(dbUserId, Date.now());
                             }
                         }
@@ -627,16 +583,8 @@ setInterval(async () => {
                     if (triggerOffset) {
                         logForProfile(firstProfileId, `⚖️ SMART OFFSET V2 [${reason}]: Paired Rank ${winnerIndex + 1} & ${loserIndex + 1} - Closing Winner [${biggestWinner.symbol}] & Loser [${biggestLoser.symbol}]. NET: ${netResult >= 0 ? '+' : ''}$${netResult.toFixed(4)}`);
                         
-                        OffsetRecord.create({
-                            userId: dbUserId,
-                            winnerSymbol: biggestWinner.symbol,
-                            winnerPnl: biggestWinner.unrealizedPnl,
-                            loserSymbol: biggestLoser.symbol,
-                            loserPnl: biggestLoser.unrealizedPnl,
-                            netProfit: netResult
-                        }).catch(()=>{});
+                        OffsetRecord.create({ userId: dbUserId, winnerSymbol: biggestWinner.symbol, winnerPnl: biggestWinner.unrealizedPnl, loserSymbol: biggestLoser.symbol, loserPnl: biggestLoser.unrealizedPnl, netProfit: netResult }).catch(()=>{});
 
-                        // 🛑 Lock to prevent Ghost execution overlaps
                         const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
                         if(bStateW) { bStateW.lockUntil = Date.now() + 8000; bStateW.contracts = 0; }
                         
@@ -660,7 +608,6 @@ setInterval(async () => {
                         }
                     }
                 }
-                
                 if (offsetExecuted2) continue; 
             }
 
@@ -679,9 +626,7 @@ setInterval(async () => {
                 
                 if (globalPnlPeaks.has(dbUserId)) {
                     const peak = globalPnlPeaks.get(dbUserId);
-                    if ((peak - globalUnrealized) >= globalTrailingPnl) {
-                        executeGlobalClose = true;
-                    }
+                    if ((peak - globalUnrealized) >= globalTrailingPnl) executeGlobalClose = true;
                 }
 
                 if (executeGlobalClose) {
@@ -691,22 +636,16 @@ setInterval(async () => {
                     for (let pos of activeCandidates) {
                         try {
                             const bData = activeBots.get(pos.profileId);
-                            // 🛑 Lock to prevent Ghost execution overlaps
                             if (bData && bData.state.coinStates[pos.symbol]) {
                                 bData.state.coinStates[pos.symbol].lockUntil = Date.now() + 8000;
                                 bData.state.coinStates[pos.symbol].contracts = 0;
                                 bData.state.coinStates[pos.symbol].unrealizedPnl = 0;
                             }
-
                             const orderSide = pos.side === 'long' ? 'sell' : 'buy';
                             await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage });
-                            
                             pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                             await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
-
-                        } catch(e) {
-                            logForProfile(pos.profileId, `❌ Failed Global Close on ${pos.symbol}: ${e.message}`);
-                        }
+                        } catch(e) {}
                     }
                 }
             }
@@ -714,22 +653,30 @@ setInterval(async () => {
     } catch (err) {
         console.error("Global Profit Monitor Error:", err);
     } finally {
-        isGlobalMonitoring = false; // Release Global Loop lock
+        global.isGlobalMonitoring = false; 
     }
-}, 4000); 
+};
 
-// Startup Initialization
-setTimeout(async () => {
-    try {
-        await connectDB();
-        const activeSettings = await Settings.find({});
-        activeSettings.forEach(s => {
-            if (s.subAccounts) {
-                s.subAccounts.forEach(sub => { if (sub.coins && sub.coins.some(c => c.botActive)) startBot(s.userId.toString(), sub); });
-            }
-        });
-    } catch(e) {}
-}, 3000);
+// Vercel Singleton Initialization
+const bootstrapBots = async () => {
+    if (!global.botLoopsStarted) {
+        global.botLoopsStarted = true;
+        console.log("🛠 Bootstrapping Background Loops for Vercel...");
+        
+        setInterval(executeOneMinuteCloser, 60000);
+        setInterval(executeGlobalProfitMonitor, 4000);
+
+        try {
+            await connectDB();
+            const activeSettings = await Settings.find({});
+            activeSettings.forEach(s => {
+                if (s.subAccounts) {
+                    s.subAccounts.forEach(sub => { if (sub.coins && sub.coins.some(c => c.botActive)) startBot(s.userId.toString(), sub); });
+                }
+            });
+        } catch(e) {}
+    }
+};
 
 // ==========================================
 // 6. EXPRESS API & AUTHENTICATION
@@ -751,6 +698,7 @@ const authMiddleware = async (req, res, next) => {
 
 app.get('/api/ping', async (req, res) => {
     await connectDB(); 
+    bootstrapBots(); // Keep-alive trigger
     res.status(200).json({ success: true, message: 'Bot is awake', timestamp: new Date().toISOString(), activeProfiles: activeBots.size });
 });
 
@@ -777,11 +725,13 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.get('/api/settings', authMiddleware, async (req, res) => {
+    bootstrapBots(); // Keep-alive trigger
     const settings = await Settings.findOne({ userId: req.userId });
     res.json(settings);
 });
 
 app.post('/api/settings', authMiddleware, async (req, res) => {
+    bootstrapBots();
     const { subAccounts, globalTargetPnl, globalTrailingPnl, smartOffsetNetProfit, smartOffsetBottomRowV1, smartOffsetBottomRowV1StopLoss, smartOffsetStopLoss, smartOffsetNetProfit2, smartOffsetStopLoss2, smartOffsetMaxLossPerMinute, smartOffsetMaxLossTimeframeSeconds, minuteCloseAutoDynamic, minuteCloseMinPnl, minuteCloseMaxPnl } = req.body;
     
     const existingSettings = await Settings.findOne({ userId: req.userId });
@@ -853,13 +803,13 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/status', authMiddleware, async (req, res) => {
+    bootstrapBots(); // Keep-alive trigger
     const settings = await Settings.findOne({ userId: req.userId });
     const userStatuses = {};
     for (let [profileId, botData] of activeBots.entries()) {
         if (botData.userId === req.userId.toString()) userStatuses[profileId] = botData.state;
     }
 
-    // Clean and return current dynamic timeframe loss to UI
     let currentMinuteLoss = 0;
     const dbUserId = req.userId.toString();
     const timeframeSec = settings ? (settings.smartOffsetMaxLossTimeframeSeconds || 60) : 60;
@@ -1033,7 +983,6 @@ app.get('/', (req, res) => {
                                 <input type="number" step="1" id="smartOffsetBottomRowV1" placeholder="e.g. 5">
                             </div>
 
-                            <!-- NEW NTH ROW STOP LOSS -->
                             <div style="margin-top: 12px;">
                                 <label style="margin-top:0;">Nth Bottom Row Stop Loss (V1) ($)</label>
                                 <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">If the accumulation at the Nth Bottom Row specified above drops to or below this negative amount, it closes the entire group.</p>
@@ -1046,7 +995,6 @@ app.get('/', (req, res) => {
                                 <input type="number" step="0.1" id="smartOffsetStopLoss" placeholder="e.g. -2.00 (0 = Disabled)">
                             </div>
 
-                            <!-- TIMEFRAME CONFIGURATION -->
                             <div style="margin-top: 12px; border-top: 1px solid #cce0ff; padding-top: 12px;">
                                 <label style="margin-top:0;">Stop Loss Execution Limits</label>
                                 <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Define how often Stop Losses can occur. If Amount Limit > 0, allows multiple SLs within the timeframe up to the amount. If 0, limits to exactly 1 SL per timeframe.</p>
@@ -1175,7 +1123,7 @@ app.get('/', (req, res) => {
             let myGlobalTrailingPnl = 0;
             let mySmartOffsetNetProfit = 0;
             let mySmartOffsetBottomRowV1 = 5;
-            let mySmartOffsetBottomRowV1StopLoss = 0; // NEW JS VARIABLE
+            let mySmartOffsetBottomRowV1StopLoss = 0; 
             let mySmartOffsetStopLoss = 0;
             let mySmartOffsetNetProfit2 = 0;
             let mySmartOffsetStopLoss2 = 0;
@@ -1253,7 +1201,7 @@ app.get('/', (req, res) => {
                 myGlobalTrailingPnl = config.globalTrailingPnl || 0;
                 mySmartOffsetNetProfit = config.smartOffsetNetProfit || 0;
                 mySmartOffsetBottomRowV1 = config.smartOffsetBottomRowV1 !== undefined ? config.smartOffsetBottomRowV1 : 5;
-                mySmartOffsetBottomRowV1StopLoss = config.smartOffsetBottomRowV1StopLoss || 0; // LOAD
+                mySmartOffsetBottomRowV1StopLoss = config.smartOffsetBottomRowV1StopLoss || 0; 
                 mySmartOffsetStopLoss = config.smartOffsetStopLoss || 0;
                 mySmartOffsetNetProfit2 = config.smartOffsetNetProfit2 || 0;
                 mySmartOffsetStopLoss2 = config.smartOffsetStopLoss2 || 0;
@@ -1267,7 +1215,7 @@ app.get('/', (req, res) => {
                 document.getElementById('globalTrailingPnl').value = myGlobalTrailingPnl;
                 document.getElementById('smartOffsetNetProfit').value = mySmartOffsetNetProfit;
                 document.getElementById('smartOffsetBottomRowV1').value = mySmartOffsetBottomRowV1;
-                document.getElementById('smartOffsetBottomRowV1StopLoss').value = mySmartOffsetBottomRowV1StopLoss; // SET UI
+                document.getElementById('smartOffsetBottomRowV1StopLoss').value = mySmartOffsetBottomRowV1StopLoss; 
                 document.getElementById('smartOffsetStopLoss').value = mySmartOffsetStopLoss;
                 document.getElementById('smartOffsetNetProfit2').value = mySmartOffsetNetProfit2;
                 document.getElementById('smartOffsetStopLoss2').value = mySmartOffsetStopLoss2;
@@ -1294,7 +1242,7 @@ app.get('/', (req, res) => {
                 myGlobalTrailingPnl = parseFloat(document.getElementById('globalTrailingPnl').value) || 0;
                 mySmartOffsetNetProfit = parseFloat(document.getElementById('smartOffsetNetProfit').value) || 0;
                 mySmartOffsetBottomRowV1 = parseInt(document.getElementById('smartOffsetBottomRowV1').value) || 5;
-                mySmartOffsetBottomRowV1StopLoss = parseFloat(document.getElementById('smartOffsetBottomRowV1StopLoss').value) || 0; // SAVE UI
+                mySmartOffsetBottomRowV1StopLoss = parseFloat(document.getElementById('smartOffsetBottomRowV1StopLoss').value) || 0; 
                 mySmartOffsetStopLoss = parseFloat(document.getElementById('smartOffsetStopLoss').value) || 0;
                 mySmartOffsetNetProfit2 = parseFloat(document.getElementById('smartOffsetNetProfit2').value) || 0;
                 mySmartOffsetStopLoss2 = parseFloat(document.getElementById('smartOffsetStopLoss2').value) || 0;
@@ -1527,14 +1475,11 @@ app.get('/', (req, res) => {
                     if (st && st.coinStates) {
                         for (let sym in st.coinStates) {
                             const cs = st.coinStates[sym];
-                            
-                            // 🛑 Filter locked coins locally on dashboard UI to match backend reality
                             if (cs.status === 'Running' && cs.contracts > 0 && (!cs.lockUntil || Date.now() >= cs.lockUntil)) {
                                 totalTrading++;
                                 const pnlNum = parseFloat(cs.unrealizedPnl) || 0;
                                 if (cs.currentRoi > 0) totalAboveZero++;
                                 globalUnrealized += pnlNum;
-                                
                                 activeCandidates.push({ symbol: sym, pnl: pnlNum });
                             }
                         }
@@ -1547,9 +1492,6 @@ app.get('/', (req, res) => {
                     ? \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>\${timeframeSec}s Loss Tracker:</strong> $\${currentMinuteLoss.toFixed(2)} / $\${maxLossPerMin.toFixed(2)} Limit</div>\`
                     : \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>\${timeframeSec}s Loss Tracker:</strong> Limited to 1 SL execution per \${timeframeSec}s</div>\`;
                 
-                // ==========================================
-                // DYNAMIC 1-MINUTE CLOSER UI SYNC 
-                // ==========================================
                 let dynamicMax = 0;
                 let dynamicMin = 0;
                 let hasDynamicBoundary = false;
@@ -1577,11 +1519,10 @@ app.get('/', (req, res) => {
                     }
                 }
 
-                // If Auto-Dynamic calculates identical values (or no boundary), fallback to 0.0006 and 0.0004 for the UI
                 if (!hasDynamicBoundary || dynamicMin === dynamicMax) {
                     dynamicMax = 0.0006;
                     dynamicMin = 0.0004;
-                    hasDynamicBoundary = true; // Force UI to display these fallback values
+                    hasDynamicBoundary = true; 
                 }
 
                 const autoDynCheckbox = document.getElementById('minuteCloseAutoDynamic');
@@ -1615,7 +1556,7 @@ app.get('/', (req, res) => {
 
                     const targetV1 = globalSet.smartOffsetNetProfit || 0;
                     const stopLossV1 = globalSet.smartOffsetStopLoss || 0;
-                    const stopLossNth = globalSet.smartOffsetBottomRowV1StopLoss || 0; // LOAD NEW VAR
+                    const stopLossNth = globalSet.smartOffsetBottomRowV1StopLoss || 0; 
                     const bottomRowN = globalSet.smartOffsetBottomRowV1 !== undefined ? globalSet.smartOffsetBottomRowV1 : 5;
 
                     if (totalPairs === 0) {
@@ -1631,7 +1572,6 @@ app.get('/', (req, res) => {
                         
                         const targetRefIndex = Math.max(0, totalPairs - bottomRowN);
 
-                        // Calculate the peak first
                         for (let i = 0; i < totalPairs; i++) {
                             const w = activeCandidates[i];
                             const l = activeCandidates[totalCoins - totalPairs + i];
@@ -1642,7 +1582,6 @@ app.get('/', (req, res) => {
                                 peakAccumulation = runningAccumulation;
                                 peakRowIndex = i;
                             }
-                            
                             if (i === targetRefIndex) {
                                 nthBottomAccumulation = runningAccumulation;
                             }
@@ -1652,7 +1591,6 @@ app.get('/', (req, res) => {
                         let executingPeak = false;
                         let executingSl = false;
                         
-                        // Check if hitting the Nth Row Limit or Full Limit
                         const isHitNthSl = (stopLossNth < 0 && nthBottomAccumulation <= stopLossNth);
                         const isHitFullSl = (stopLossV1 < 0 && runningAccumulation <= stopLossV1);
 
@@ -1660,8 +1598,6 @@ app.get('/', (req, res) => {
                             topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)})!</span>\`;
                             executingPeak = true;
                         } else if (isHitNthSl || isHitFullSl) {
-                            
-                            // Check if blocked by rate limit
                             let projectedLoss = runningAccumulation; 
                             let blockedByLimit = false;
 
@@ -1679,7 +1615,6 @@ app.get('/', (req, res) => {
                                     topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit for the full group!</span>\`;
                                 }
                             }
-
                         } else {
                             let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
                             topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
@@ -1712,7 +1647,7 @@ app.get('/', (req, res) => {
                             const cColor = displayAccumulation >= 0 ? '#1e8e3e' : '#d93025';
 
                             let rowStyle = (i === peakRowIndex && peakAccumulation > 0) ? 'border: 2px solid #1e8e3e; background: #e6f4ea;' : '';
-                            if (i === targetRefIndex) rowStyle += 'border-left: 4px solid #f29900;'; // Highlight the Nth Row
+                            if (i === targetRefIndex) rowStyle += 'border-left: 4px solid #f29900;'; 
 
                             liveHtml += \`<tr style="\${rowStyle}">
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; color:#5f6368;">\${winnerIndex + 1} & \${loserIndex + 1} <br><span style="font-size:0.75em; color:#1a73e8">\${statusIcon}</span></td>
@@ -1745,7 +1680,6 @@ app.get('/', (req, res) => {
                     }
                 }
 
-                // --- RENDER LIVE SMART OFFSET TRADES (V2 - STRICT 1 TO 1 ENDS) ---
                 if (document.getElementById('offset2-tab').style.display === 'block') {
                     activeCandidates.sort((a, b) => b.pnl - a.pnl);
                     const totalCoins = activeCandidates.length;
@@ -1823,7 +1757,6 @@ app.get('/', (req, res) => {
                         document.getElementById('liveOffsetsContainer2').innerHTML = dynamicInfoHtml2 + liveHtml;
                     }
                 }
-                // ---------------------------------------
 
                 document.getElementById('globalWinRate').innerText = \`\${totalAboveZero} / \${totalTrading}\`;
                 
@@ -1856,7 +1789,6 @@ app.get('/', (req, res) => {
                         let roiColorClass = state.currentRoi >= 0 ? 'val green' : 'val red';
                         const displaySide = coin.side || profile.side || 'long';
 
-                        // 🛑 UI Note for locked coins
                         if (state.lockUntil && Date.now() < state.lockUntil) {
                             statusColor = '#f29900';
                             state.status = 'Closing / Locked';
