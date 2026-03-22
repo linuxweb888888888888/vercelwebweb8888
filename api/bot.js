@@ -107,7 +107,7 @@ global.activeBots = global.activeBots || new Map();
 global.globalPnlPeaks = global.globalPnlPeaks || new Map(); 
 global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
 global.rollingStopLosses = global.rollingStopLosses || new Map(); 
-global.autoDynamicExecutions = global.autoDynamicExecutions || new Map(); // Tracker for UI Dashboard
+global.autoDynamicExecutions = global.autoDynamicExecutions || new Map(); 
 
 const activeBots = global.activeBots;
 const globalPnlPeaks = global.globalPnlPeaks;
@@ -300,12 +300,10 @@ const executeOneMinuteCloser = async () => {
         for (let userSetting of usersSettings) {
             const dbUserId = String(userSetting.userId);
             
-            // Treat user inputs: TP is positive absolute, SL is negative absolute
             let rawTpMin = Math.abs(parseFloat(userSetting.minuteCloseTpMinPnl) || 0);
             let rawTpMax = Math.abs(parseFloat(userSetting.minuteCloseTpMaxPnl) || 0);
             let rawSlMin = -Math.abs(parseFloat(userSetting.minuteCloseSlMinPnl) || 0);
             let rawSlMax = -Math.abs(parseFloat(userSetting.minuteCloseSlMaxPnl) || 0);
-            
             const autoDynamic = userSetting.minuteCloseAutoDynamic || false;
             
             let activeCandidates = [];
@@ -318,6 +316,7 @@ const executeOneMinuteCloser = async () => {
                             profileId, symbol, exchange: botData.exchange,
                             pnl: parseFloat(cState.unrealizedPnl) || 0,
                             contracts: cState.contracts,
+                            side: botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side,
                             subAccount: botData.settings,
                             cState: cState
                         });
@@ -325,88 +324,105 @@ const executeOneMinuteCloser = async () => {
                 }
             }
 
-            if (autoDynamic && activeCandidates.length >= 2) {
-                activeCandidates.sort((a, b) => b.pnl - a.pnl);
-                const totalCoins = activeCandidates.length;
-                const totalPairs = Math.floor(totalCoins / 2);
+            activeCandidates.sort((a, b) => b.pnl - a.pnl);
+            const totalCoins = activeCandidates.length;
+            const totalPairs = Math.floor(totalCoins / 2);
+
+            if (totalPairs === 0) continue;
+
+            // 1. AUTO-DYNAMIC GROUP PEAK LOGIC
+            if (autoDynamic) {
                 let runningAccumulation = 0;
                 let peakAccumulation = 0;
-                let peakRowIndex = -1;
 
                 for (let i = 0; i < totalPairs; i++) {
                     const netResult = activeCandidates[i].pnl + activeCandidates[totalCoins - totalPairs + i].pnl;
                     runningAccumulation += netResult;
                     if (runningAccumulation > peakAccumulation) {
                         peakAccumulation = runningAccumulation;
-                        peakRowIndex = i;
                     }
                 }
 
-                if (peakRowIndex >= 0 && peakRowIndex + 1 < totalPairs) {
-                    let val1 = activeCandidates[peakRowIndex].pnl;
-                    let val2 = activeCandidates[peakRowIndex + 1].pnl;
+                if (peakAccumulation > 0) {
+                    // TP Range captures the Group Peak exactly
+                    rawTpMin = peakAccumulation * 0.8;
+                    rawTpMax = peakAccumulation * 1.2;
                     
-                    // ASYMMETRIC RISK/REWARD (2:1 Ratio to ensure gaining more than losing)
-                    rawTpMin = Math.min(Math.abs(val1), Math.abs(val2));
-                    rawTpMax = Math.max(Math.abs(val1), Math.abs(val2));
-                    
-                    // Stop losses cut at exactly 50% of the Take Profit targets
-                    rawSlMin = -(rawTpMax * 0.5); 
-                    rawSlMax = -(rawTpMin * 0.5);
+                    // SL Range strictly enforces the 2:1 ASYMMETRIC RATIO based on the group peak
+                    rawSlMin = -(peakAccumulation * 5.0); 
+                    rawSlMax = -(peakAccumulation * 0.5); 
                 } else {
                     rawTpMin = 0; rawTpMax = 0; rawSlMin = 0; rawSlMax = 0;
                 }
 
-                // If difference is extremely small, disable for this cycle to prevent false chops
                 if (Math.abs(rawTpMax - rawTpMin) <= 0.000101) {
                     rawTpMin = 0; rawTpMax = 0; rawSlMin = 0; rawSlMax = 0;
                 }
             }
 
-            // Create guaranteed ordered ranges safely
             const tpMin = Math.min(rawTpMin, rawTpMax);
             const tpMax = Math.max(rawTpMin, rawTpMax);
-            const slMin = Math.min(rawSlMin, rawSlMax); // highly negative e.g. -0.0008
-            const slMax = Math.max(rawSlMin, rawSlMax); // closer to zero e.g. -0.0004
+            const slMin = Math.min(rawSlMin, rawSlMax); 
+            const slMax = Math.max(rawSlMin, rawSlMax); 
 
-            if (tpMax === 0 && slMin === 0) continue; 
+            if (tpMax === 0 && slMax === 0) continue; 
 
-            for (let pos of activeCandidates) {
-                // Independent Checks
-                const isPositiveMatch = (tpMax > 0 && pos.pnl > 0 && pos.pnl >= tpMin && pos.pnl <= tpMax);
-                const isNegativeMatch = (slMin < 0 && pos.pnl < 0 && pos.pnl >= slMin && pos.pnl <= slMax);
+            // 2. EVALUATE GROUP ACCUMULATION AGAINST RANGES
+            let runningAccumulation = 0;
+            let executedGroup = false;
 
-                if (isPositiveMatch || isNegativeMatch) {
-                    const executionType = isPositiveMatch ? "Take Profit" : "Stop Loss";
+            for (let i = 0; i < totalPairs; i++) {
+                const w = activeCandidates[i];
+                const l = activeCandidates[totalCoins - totalPairs + i];
+                runningAccumulation += (w.pnl + l.pnl);
+
+                const isPositiveMatch = (tpMax > 0 && runningAccumulation > 0 && runningAccumulation >= tpMin && runningAccumulation <= tpMax);
+                const isNegativeMatch = (slMin < 0 && runningAccumulation < 0 && runningAccumulation >= slMin && runningAccumulation <= slMax);
+
+                if (!executedGroup && (isPositiveMatch || isNegativeMatch)) {
+                    const executionType = isPositiveMatch ? "Group Take Profit" : "Group Stop Loss (2:1 Ratio)";
                     
-                    // Record to Global Tracker for Frontend UI display
                     autoDynamicExecutions.set(dbUserId, {
                         time: Date.now(),
                         type: executionType,
-                        symbol: pos.symbol,
-                        pnl: pos.pnl
+                        symbol: `Group up to Row ${i + 1}`,
+                        pnl: runningAccumulation
                     });
 
-                    logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Range Closer: PNL $${pos.pnl.toFixed(4)} matches the ${executionType} boundary. Closing position.`);
-                    
-                    pos.cState.lockUntil = Date.now() + 10000;
-                    const contractsToClose = pos.contracts;
-                    pos.cState.contracts = 0;
-                    pos.cState.unrealizedPnl = 0;
-                    pos.cState.currentRoi = 0;
+                    logForProfile(activeCandidates[0].profileId, `⏳ 1-Min Group Closer: Group Accumulation $${runningAccumulation.toFixed(4)} matches the ${executionType} boundary. Closing ${(i + 1) * 2} coins.`);
 
-                    const activeSide = pos.subAccount.coins.find(c => c.symbol === pos.symbol)?.side || pos.subAccount.side;
-                    const orderSide = activeSide === 'long' ? 'sell' : 'buy';
-                    
-                    pos.exchange.createOrder(pos.symbol, 'market', orderSide, contractsToClose, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.subAccount.leverage }).catch(()=>{});
+                    // Close all coins inside this exact accumulation group
+                    for (let k = 0; k <= i; k++) {
+                        const cw = activeCandidates[k];
+                        const cl = activeCandidates[totalCoins - totalPairs + k];
+                        
+                        // Close Winner
+                        cw.cState.lockUntil = Date.now() + 10000;
+                        const cwContracts = cw.contracts;
+                        cw.cState.contracts = 0; cw.cState.unrealizedPnl = 0; cw.cState.currentRoi = 0;
+                        const cwOrderSide = cw.side === 'long' ? 'sell' : 'buy';
+                        cw.exchange.createOrder(cw.symbol, 'market', cwOrderSide, cwContracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: cw.subAccount.leverage }).catch(()=>{});
+                        cw.subAccount.realizedPnl = (cw.subAccount.realizedPnl || 0) + cw.pnl;
 
-                    pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.pnl;
-                    Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
+                        // Close Loser
+                        cl.cState.lockUntil = Date.now() + 10000;
+                        const clContracts = cl.contracts;
+                        cl.cState.contracts = 0; cl.cState.unrealizedPnl = 0; cl.cState.currentRoi = 0;
+                        const clOrderSide = cl.side === 'long' ? 'sell' : 'buy';
+                        cl.exchange.createOrder(cl.symbol, 'market', clOrderSide, clContracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: cl.subAccount.leverage }).catch(()=>{});
+                        cl.subAccount.realizedPnl = (cl.subAccount.realizedPnl || 0) + cl.pnl;
+                        
+                        Settings.updateOne({ "subAccounts._id": cw.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": cw.subAccount.realizedPnl } }).catch(()=>{});
+                        Settings.updateOne({ "subAccounts._id": cl.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": cl.subAccount.realizedPnl } }).catch(()=>{});
+                    }
+
+                    executedGroup = true;
+                    break; 
                 }
             }
         }
     } catch (err) {
-        console.error("1-Min Range Closer Error:", err);
+        console.error("1-Min Group Closer Error:", err);
     }
 };
 
@@ -769,7 +785,7 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
     let parsedStopLoss2 = parseFloat(smartOffsetStopLoss2) || 0;
     if (parsedStopLoss2 > 0) parsedStopLoss2 = -parsedStopLoss2; 
 
-    // Independent Range Parsing
+    // Independent Group Range Parsing
     let parsedTpMin = Math.abs(parseFloat(minuteCloseTpMinPnl) || 0);
     let parsedTpMax = Math.abs(parseFloat(minuteCloseTpMaxPnl) || 0);
     let parsedSlMin = -Math.abs(parseFloat(minuteCloseSlMinPnl) || 0);
@@ -976,7 +992,7 @@ app.get('/', (req, res) => {
                 <!-- 1-MIN AUTO-DYNAMIC STATUS TRACKER -->
                 <div id="autoDynStatusBox" style="display:none; background:#e8f0fe; border: 1px solid #cce0ff; padding: 16px; border-radius: 8px; margin-bottom: 24px;">
                     <h3 style="margin-top:0; color:#1a73e8; border-bottom:1px solid #cce0ff; padding-bottom:8px; font-size:1.1em;">
-                        ⚡ 1-Min Auto-Dynamic Status (2:1 Ratio Tracker)
+                        ⚡ 1-Min Auto-Dynamic Status (Group Tracker & 2:1 Ratio)
                     </h3>
                     <div id="autoDynLiveDetails"></div>
                 </div>
@@ -1037,18 +1053,18 @@ app.get('/', (req, res) => {
 
                             <div style="margin-top: 12px; border-top: 1px solid #cce0ff; padding-top: 12px;">
                                 <label style="margin-top:0; display:flex; align-items:center;">
-                                    1-Min Independent Ranges (TP & SL Range)
+                                    1-Min Group Auto-Dynamic Closer (TP & SL Ranges)
                                     <input type="checkbox" id="minuteCloseAutoDynamic" style="width:auto; margin-left:12px; margin-right:4px;"> Auto-Dynamic
                                 </label>
-                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Auto-Dynamic finds the positive peak and sets a <strong>2:1 Profit-to-Loss ratio</strong>. It sets your Stop Loss boundary to exactly 50% of the Take Profit boundary, aggressively cutting losers early so you gain more profit than you lose.</p>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Auto-Dynamic finds the Group Accumulation Peak and sets it as the Take Profit target. It sets the Stop Loss to exactly 50% of the peak to aggressively cut losers early (2:1 Ratio).</p>
                                 
                                 <div style="background:#f8f9fa; padding:12px; border:1px solid #dadce0; border-radius:6px; margin-top:8px;">
-                                    <label style="margin-top:0; color:#1e8e3e;">Take Profit Range ($)</label>
+                                    <label style="margin-top:0; color:#1e8e3e;">Group Take Profit Range ($)</label>
                                     <div class="flex-row">
                                         <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseTpMinPnl" placeholder="Min TP (e.g. 0.0001)"></div>
                                         <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseTpMaxPnl" placeholder="Max TP (e.g. 0.0004)"></div>
                                     </div>
-                                    <label style="margin-top:12px; color:#d93025;">Stop Loss Range ($)</label>
+                                    <label style="margin-top:12px; color:#d93025;">Group Stop Loss Range ($)</label>
                                     <div class="flex-row">
                                         <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseSlMinPnl" placeholder="Min SL (e.g. -0.0008)"></div>
                                         <div style="flex:1;"><input type="number" step="0.0001" id="minuteCloseSlMaxPnl" placeholder="Max SL (e.g. -0.0004)"></div>
@@ -1537,39 +1553,19 @@ app.get('/', (req, res) => {
                     ? \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>\${timeframeSec}s Loss Tracker:</strong> $\${currentMinuteLoss.toFixed(2)} / $\${maxLossPerMin.toFixed(2)} Limit</div>\`
                     : \`<div style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #b3d4ff;">⏳ <strong>\${timeframeSec}s Loss Tracker:</strong> Limited to 1 SL execution per \${timeframeSec}s</div>\`;
                 
-                let dynamicMax = 0;
-                let dynamicMin = 0;
+                let sortedCands = [...activeCandidates].sort((a, b) => b.pnl - a.pnl);
+                let tCoins = sortedCands.length;
+                let tPairs = Math.floor(tCoins / 2);
                 let hasDynamicBoundary = false;
+                let peakAccumulation = 0;
 
-                if (activeCandidates.length >= 2) {
-                    let sortedCands = [...activeCandidates].sort((a, b) => b.pnl - a.pnl);
-                    let tCoins = sortedCands.length;
-                    let tPairs = Math.floor(tCoins / 2);
+                if (tPairs > 0) {
                     let rAcc = 0;
-                    let pAcc = 0;
-                    let pIdx = -1;
-                    
                     for (let i = 0; i < tPairs; i++) {
-                        let net = sortedCands[i].pnl + sortedCands[tCoins - tPairs + i].pnl;
-                        rAcc += net;
-                        if (rAcc > pAcc) {
-                            pAcc = rAcc;
-                            pIdx = i;
-                        }
+                        rAcc += sortedCands[i].pnl + sortedCands[tCoins - tPairs + i].pnl;
+                        if (rAcc > peakAccumulation) peakAccumulation = rAcc;
                     }
-                    if (pIdx >= 0 && pIdx + 1 < tPairs) {
-                        let val1 = sortedCands[pIdx].pnl;
-                        let val2 = sortedCands[pIdx + 1].pnl;
-                        dynamicMax = Math.abs(Math.max(val1, val2));
-                        dynamicMin = Math.abs(Math.min(val1, val2));
-                        hasDynamicBoundary = true;
-                    }
-                }
-
-                if (!hasDynamicBoundary || Math.abs(dynamicMax - dynamicMin) <= 0.000101) {
-                    hasDynamicBoundary = false; 
-                    dynamicMax = 0;
-                    dynamicMin = 0;
+                    if (peakAccumulation > 0) hasDynamicBoundary = true;
                 }
 
                 const autoDynCheckbox = document.getElementById('minuteCloseAutoDynamic');
@@ -1588,14 +1584,16 @@ app.get('/', (req, res) => {
                     
                     autoDynStatusBox.style.display = 'block';
 
-                    let tpMin = Math.min(dynamicMin, dynamicMax);
-                    let slMax = -(tpMin * 0.5); // ASYMMETRIC 50% mapping
+                    let tpMinBound = peakAccumulation * 0.8;
+                    let tpMaxBound = peakAccumulation * 1.2;
+                    let slMaxBound = -(peakAccumulation * 0.5);
+                    let slMinBound = -(peakAccumulation * 5.0);
 
                     if (hasDynamicBoundary) {
-                        tpMinInput.value = tpMin.toFixed(4);
-                        tpMaxInput.value = Math.max(dynamicMin, dynamicMax).toFixed(4);
-                        slMaxInput.value = slMax.toFixed(4);
-                        slMinInput.value = (-(Math.max(dynamicMin, dynamicMax) * 0.5)).toFixed(4);
+                        tpMinInput.value = tpMinBound.toFixed(4);
+                        tpMaxInput.value = tpMaxBound.toFixed(4);
+                        slMaxInput.value = slMaxBound.toFixed(4);
+                        slMinInput.value = slMinBound.toFixed(4);
                     } else {
                         tpMinInput.value = ''; tpMaxInput.value = '';
                         slMinInput.value = ''; slMaxInput.value = '';
@@ -1603,27 +1601,36 @@ app.get('/', (req, res) => {
 
                     // Populate UI Tracker
                     let adHtml = '';
-                    if (hasDynamicBoundary && activeCandidates.length > 0) {
-                        let highestCoin = activeCandidates.reduce((prev, current) => (prev.pnl > current.pnl) ? prev : current, activeCandidates[0]);
-                        let lowestCoin = activeCandidates.reduce((prev, current) => (prev.pnl < current.pnl) ? prev : current, activeCandidates[0]);
+                    if (hasDynamicBoundary && tPairs > 0) {
+                        let highestGroupAcc = -99999;
+                        let lowestGroupAcc = 99999;
+                        let highestGroupIndex = -1;
+                        let lowestGroupIndex = -1;
 
-                        let distToTp = tpMin - highestCoin.pnl;
-                        let distToSl = lowestCoin.pnl - slMax; 
+                        let currentAcc = 0;
+                        for (let i = 0; i < tPairs; i++) {
+                            currentAcc += sortedCands[i].pnl + sortedCands[tCoins - tPairs + i].pnl;
+                            if (currentAcc > highestGroupAcc) { highestGroupAcc = currentAcc; highestGroupIndex = i; }
+                            if (currentAcc < lowestGroupAcc) { lowestGroupAcc = currentAcc; lowestGroupIndex = i; }
+                        }
+
+                        let distToTp = tpMinBound - highestGroupAcc;
+                        let distToSl = lowestGroupAcc - slMaxBound; 
 
                         let tpDistText = distToTp > 0 ? \`$\${distToTp.toFixed(4)} away\` : \`<span style="color:#1e8e3e; font-weight:bold;">IN RANGE</span>\`;
                         let slDistText = distToSl > 0 ? \`$\${distToSl.toFixed(4)} away\` : \`<span style="color:#d93025; font-weight:bold;">IN RANGE</span>\`;
 
                         adHtml += \`<div class="flex-row" style="justify-content: space-between; margin-bottom: 12px;">\`;
-                        adHtml += \`<div><span class="stat-label">Closest to Take Profit (Target: $\${tpMin.toFixed(4)})</span><span class="val">\${highestCoin.symbol}: <span style="color:\${highestCoin.pnl >= 0 ? '#1e8e3e' : '#d93025'}">$\${highestCoin.pnl.toFixed(4)}</span> <span style="font-size:0.65em; font-weight:normal;">(\${tpDistText})</span></span></div>\`;
-                        adHtml += \`<div><span class="stat-label">Closest to Stop Loss (Limit: $\${slMax.toFixed(4)})</span><span class="val">\${lowestCoin.symbol}: <span style="color:\${lowestCoin.pnl >= 0 ? '#1e8e3e' : '#d93025'}">$\${lowestCoin.pnl.toFixed(4)}</span> <span style="font-size:0.65em; font-weight:normal;">(\${slDistText})</span></span></div>\`;
+                        adHtml += \`<div><span class="stat-label">Closest to Group Take Profit (Target: $\${tpMinBound.toFixed(4)})</span><span class="val">Row \${highestGroupIndex + 1} Group: <span style="color:\${highestGroupAcc >= 0 ? '#1e8e3e' : '#d93025'}">$\${highestGroupAcc.toFixed(4)}</span> <span style="font-size:0.65em; font-weight:normal;">(\${tpDistText})</span></span></div>\`;
+                        adHtml += \`<div><span class="stat-label">Closest to Group Stop Loss (Limit: $\${slMaxBound.toFixed(4)})</span><span class="val">Row \${lowestGroupIndex + 1} Group: <span style="color:\${lowestGroupAcc >= 0 ? '#1e8e3e' : '#d93025'}">$\${lowestGroupAcc.toFixed(4)}</span> <span style="font-size:0.65em; font-weight:normal;">(\${slDistText})</span></span></div>\`;
                         adHtml += \`</div>\`;
                     } else {
-                        adHtml += \`<p style="color:#5f6368; font-size:0.9em; margin-bottom:12px;">Calculating dynamic boundaries... (needs at least 2 active coins and a measurable peak)</p>\`;
+                        adHtml += \`<p style="color:#5f6368; font-size:0.9em; margin-bottom:12px;">Calculating dynamic boundaries... (needs at least 2 active coins and a positive peak)</p>\`;
                     }
 
                     if (data.autoDynExec) {
                         const execDate = new Date(data.autoDynExec.time).toLocaleTimeString();
-                        const typeColor = data.autoDynExec.type === 'Take Profit' ? '#1e8e3e' : '#d93025';
+                        const typeColor = data.autoDynExec.type === 'Group Take Profit' ? '#1e8e3e' : '#d93025';
                         adHtml += \`<div style="border-top:1px dashed #b3d4ff; padding-top:12px; font-size:0.9em;">
                             <strong>Last Execution:</strong> <span style="color:\${typeColor}; font-weight:bold;">\${data.autoDynExec.type}</span> on <strong>\${data.autoDynExec.symbol}</strong> at PNL <span style="color:\${typeColor};">$\${data.autoDynExec.pnl.toFixed(4)}</span> (\${execDate})
                         </div>\`;
