@@ -81,9 +81,9 @@ const SettingsSchema = new mongoose.Schema({
     smartOffsetMaxLossPerMinute: { type: Number, default: 0 }, 
     smartOffsetMaxLossTimeframeSeconds: { type: Number, default: 60 },
     minuteCloseAutoDynamic: { type: Boolean, default: false },
-    minuteCloseTpMinPnl: { type: Number, default: 0 }, // Separated TP Range
+    minuteCloseTpMinPnl: { type: Number, default: 0 }, 
     minuteCloseTpMaxPnl: { type: Number, default: 0 },
-    minuteCloseSlMinPnl: { type: Number, default: 0 }, // Separated SL Range
+    minuteCloseSlMinPnl: { type: Number, default: 0 }, 
     minuteCloseSlMaxPnl: { type: Number, default: 0 },
     subAccounts: [SubAccountSchema]
 });
@@ -103,7 +103,6 @@ const OffsetRecord = mongoose.models.OffsetRecord || mongoose.model('OffsetRecor
 // ==========================================
 // 3. MULTI-PROFILE BOT ENGINE STATE (Vercel Cached)
 // ==========================================
-// Attach states to global so Vercel doesn't wipe them on hot-reloads
 global.activeBots = global.activeBots || new Map();
 global.globalPnlPeaks = global.globalPnlPeaks || new Map(); 
 global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
@@ -345,18 +344,18 @@ const executeOneMinuteCloser = async () => {
                     let val1 = activeCandidates[peakRowIndex].pnl;
                     let val2 = activeCandidates[peakRowIndex + 1].pnl;
                     
-                    // Mirror positive peak to exact magnitude boundaries
+                    // ASYMMETRIC RISK/REWARD (2:1 Ratio to ensure gaining more than losing)
                     rawTpMin = Math.min(Math.abs(val1), Math.abs(val2));
                     rawTpMax = Math.max(Math.abs(val1), Math.abs(val2));
                     
-                    // Set SL ranges strictly negative mirrored from the positive side
-                    rawSlMin = -rawTpMax; 
-                    rawSlMax = -rawTpMin;
+                    // Stop losses cut at exactly 50% of the Take Profit targets
+                    rawSlMin = -(rawTpMax * 0.5); 
+                    rawSlMax = -(rawTpMin * 0.5);
                 } else {
                     rawTpMin = 0; rawTpMax = 0; rawSlMin = 0; rawSlMax = 0;
                 }
 
-                // If difference is 0.0001 or less, disable for this cycle
+                // If difference is extremely small, disable for this cycle to prevent false chops
                 if (Math.abs(rawTpMax - rawTpMin) <= 0.000101) {
                     rawTpMin = 0; rawTpMax = 0; rawSlMin = 0; rawSlMax = 0;
                 }
@@ -376,7 +375,7 @@ const executeOneMinuteCloser = async () => {
                 const isNegativeMatch = (slMin < 0 && pos.pnl < 0 && pos.pnl >= slMin && pos.pnl <= slMax);
 
                 if (isPositiveMatch || isNegativeMatch) {
-                    const sideStr = isPositiveMatch ? "Take Profit" : "Stop Loss";
+                    const sideStr = isPositiveMatch ? "Take Profit" : "Stop Loss (2:1 Ratio Protected)";
                     logForProfile(pos.profileId, `[${pos.symbol}] ⏳ 1-Min Range Closer: PNL $${pos.pnl.toFixed(4)} matches the ${sideStr} boundary. Closing position.`);
                     
                     pos.cState.lockUntil = Date.now() + 10000;
@@ -1020,7 +1019,7 @@ app.get('/', (req, res) => {
                                     1-Min Independent Ranges (TP & SL Range)
                                     <input type="checkbox" id="minuteCloseAutoDynamic" style="width:auto; margin-left:12px; margin-right:4px;"> Auto-Dynamic
                                 </label>
-                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Separate inputs allow different ranges for taking profit and stopping loss. Auto-Dynamic will populate both symmetrically.</p>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Checks every 60s. Auto-Dynamic finds the positive peak and sets a <strong>2:1 Profit-to-Loss ratio</strong>. It sets your Stop Loss boundary to exactly 50% of the Take Profit boundary, aggressively cutting losers early so you gain more profit than you lose.</p>
                                 
                                 <div style="background:#f8f9fa; padding:12px; border:1px solid #dadce0; border-radius:6px; margin-top:8px;">
                                     <label style="margin-top:0; color:#1e8e3e;">Take Profit Range ($)</label>
@@ -1568,9 +1567,9 @@ app.get('/', (req, res) => {
                     if (hasDynamicBoundary) {
                         tpMinInput.value = Math.min(dynamicMin, dynamicMax).toFixed(4);
                         tpMaxInput.value = Math.max(dynamicMin, dynamicMax).toFixed(4);
-                        // SL ranges negative equivalent mapping
-                        slMaxInput.value = (-Math.min(dynamicMin, dynamicMax)).toFixed(4);
-                        slMinInput.value = (-Math.max(dynamicMin, dynamicMax)).toFixed(4);
+                        // SL ranges negative ASYMMETRIC mapping (50%)
+                        slMaxInput.value = (-(Math.min(dynamicMin, dynamicMax) * 0.5)).toFixed(4);
+                        slMinInput.value = (-(Math.max(dynamicMin, dynamicMax) * 0.5)).toFixed(4);
                     } else {
                         tpMinInput.value = ''; tpMaxInput.value = '';
                         slMinInput.value = ''; slMaxInput.value = '';
