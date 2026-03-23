@@ -1,19 +1,3 @@
-I have removed all hardcoded minimums ($0.05 and $0.02) across the entire AI Engine.
-
-The AI will now close the group, absorb clusters, or trim 1-to-1 as long as the net profit is strictly greater than zero (> 0).
-
-I have updated this in both the Backend Execution Logic and the Frontend Visual Radar so the UI accurately simulates and displays exactly what the AI is about to do.
-
-Here is the complete, final code from top to bottom.
-
-The Complete Code (index.js or server.js)
-code
-JavaScript
-download
-content_copy
-expand_less
-//web8888
-
 const express = require('express');
 const ccxt = require('ccxt');
 const mongoose = require('mongoose');
