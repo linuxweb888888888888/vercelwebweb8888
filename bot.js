@@ -642,14 +642,15 @@ app.get('/', (req, res) => {
             <div id="aipilot-tab" style="display:none;">
                 <div class="panel ai-glow" style="border: 1px solid #1a73e8;">
                     
-                    <!-- NEW TOP HEADER WITH INJECTED PEAK BADGE -->
-                    <div class="flex-row" style="justify-content: space-between; flex-wrap: wrap; gap: 10px;">
-                        <div class="flex-row" style="align-items: center; flex-wrap: wrap;">
-                            <h2 style="color: #1a73e8; border: none; margin: 0;">🤖 AI Pilot Telemetry & Live Radar</h2>
-                            <div id="aiTopPeakBadge" style="margin-left: 10px; padding: 6px 12px; background: #e8f0fe; border-radius: 20px; color: #1a73e8; font-weight: bold; font-size: 0.9em; border: 1px solid #1a73e8;">
+                    <!-- NEW TOP HEADER WITH INJECTED PEAK BADGE (BULLETPROOF PLACEMENT) -->
+                    <div class="flex-row" style="justify-content: space-between; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 12px;">
+                        <h2 style="color: #1a73e8; border: none; margin: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 15px;">
+                            🤖 AI Pilot Telemetry & Live Radar
+                            <!-- THE PEAK BADGE INSIDE THE HEADER -->
+                            <span id="aiTopPeakBadge" style="padding: 4px 12px; background: #e8f0fe; border-radius: 20px; color: #1a73e8; font-weight: bold; font-size: 0.75em; border: 1px solid #1a73e8; display: inline-block;">
                                 🏆 Peak: +$0.0000 | 💧 Tension: 0%
-                            </div>
-                        </div>
+                            </span>
+                        </h2>
                         <div id="aiMasterStatus" style="font-weight: bold; padding: 8px 16px; border-radius: 4px;">Loading...</div>
                     </div>
                     
@@ -970,8 +971,11 @@ app.get('/', (req, res) => {
                         groupTrailStatus = '<span style="color:#5f6368;">Waiting for positions to reach profit to engage Dynamic Cluster Trailing.</span>';
                     }
 
-                    // 🚨 NEW TOP VISUAL BADGE PINNED NEXT TO THE TITLE
-                    document.getElementById('aiTopPeakBadge').innerHTML = '🏆 Peak: +$' + peakW.toFixed(4) + ' &nbsp;|&nbsp; 💧 Tension: ' + pctToDrop + '%';
+                    // 🚨 INJECT THE BADGE 🚨
+                    const badgeEl = document.getElementById('aiTopPeakBadge');
+                    if (badgeEl) {
+                        badgeEl.innerHTML = '🏆 Peak: +$' + peakW.toFixed(4) + ' &nbsp;|&nbsp; 💧 Tension: ' + pctToDrop + '%';
+                    }
 
                     document.getElementById('aiWinnersGroupRadar').innerHTML = 
                         '<div class="flex-row" style="justify-content: space-between; margin-bottom: 12px;">' +
