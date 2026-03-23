@@ -108,12 +108,14 @@ global.globalPnlPeaks = global.globalPnlPeaks || new Map();
 global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
 global.rollingStopLosses = global.rollingStopLosses || new Map(); 
 global.autoDynamicExecutions = global.autoDynamicExecutions || new Map(); 
+global.lastNoPeakSlExecutions = global.lastNoPeakSlExecutions || new Map(); // Tracks the "Lowest PNL" 1-min interval
 
 const activeBots = global.activeBots;
 const globalPnlPeaks = global.globalPnlPeaks;
 const lastStopLossExecutions = global.lastStopLossExecutions;
 const rollingStopLosses = global.rollingStopLosses;
 const autoDynamicExecutions = global.autoDynamicExecutions;
+const lastNoPeakSlExecutions = global.lastNoPeakSlExecutions;
 
 function logForProfile(profileId, msg) {
     console.log(`[Profile: ${profileId}] ${msg}`);
@@ -399,9 +401,6 @@ const executeOneMinuteCloser = async () => {
                         cw.exchange.createOrder(cw.symbol, 'market', cwOrderSide, cwContracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: cw.subAccount.leverage }).catch(()=>{});
                         cw.subAccount.realizedPnl = (cw.subAccount.realizedPnl || 0) + cw.pnl;
                         Settings.updateOne({ "subAccounts._id": cw.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": cw.subAccount.realizedPnl } }).catch(()=>{});
-
-                        // --- CHANGED: IGNORED LOSER CLOSURE ---
-                        // We leave 'cl' alone to recover
                     }
 
                     executedGroup = true;
@@ -511,6 +510,7 @@ const executeGlobalProfitMonitor = async () => {
                 let reason = '';
                 let finalPairsToClose = [];
                 let finalNetProfit = 0;
+                let isNoPeakSl = false; // Flag to identify our specialized Lowest PNL sl
                 
                 const isFullGroupSl = (smartOffsetStopLoss < 0 && runningAccumulation <= smartOffsetStopLoss);
 
@@ -520,16 +520,11 @@ const executeGlobalProfitMonitor = async () => {
                     
                     for(let i = 0; i <= peakRowIndex; i++) {
                         const w = activeCandidates[i];
-                        
-                        // DOUBLE CHECK 1: Skip closing dust pairs 
-                        if (Math.abs(w.unrealizedPnl) <= 0.0002) continue;
-
-                        finalPairsToClose.push(w); // --- CHANGED: ONLY PUSH WINNER ---
+                        if (Math.abs(w.unrealizedPnl) <= 0.0002) continue; // Skip closing dust pairs 
+                        finalPairsToClose.push(w); // ONLY PUSH WINNER
                     }
                     
-                    if (finalPairsToClose.length === 0) {
-                        triggerOffset = false; 
-                    }
+                    if (finalPairsToClose.length === 0) triggerOffset = false; 
                 } 
                 // Stop Losses (Full Group)
                 else if (isFullGroupSl) {
@@ -551,15 +546,32 @@ const executeGlobalProfitMonitor = async () => {
                         if(smartOffsetMaxLossPerMinute <= 0) lastStopLossExecutions.set(dbUserId, Date.now());
 
                         for(let i = 0; i < totalPairs; i++) {
-                            finalPairsToClose.push(activeCandidates[i]); // --- CHANGED: ONLY PUSH WINNERS ---
+                            finalPairsToClose.push(activeCandidates[i]); // ONLY PUSH WINNERS
                         }
+                    }
+                }
+                // Stop Loss (NO PEAK FOUND -> Lowest PNL Coin)
+                else if (peakRowIndex === -1) {
+                    let allowNoPeakSl = false;
+                    if (Date.now() - (lastNoPeakSlExecutions.get(dbUserId) || 0) >= 60000) allowNoPeakSl = true;
+
+                    if (allowNoPeakSl) {
+                        triggerOffset = true;
+                        isNoPeakSl = true;
+                        reason = "NO PEAK (Closing Lowest PNL every 1 min)";
+                        
+                        // Absolute worst coin is the last element
+                        const absoluteWorstCoin = activeCandidates[activeCandidates.length - 1];
+                        finalNetProfit = absoluteWorstCoin.unrealizedPnl;
+                        finalPairsToClose.push(absoluteWorstCoin);
+
+                        lastNoPeakSlExecutions.set(dbUserId, Date.now());
                     }
                 }
 
                 if (triggerOffset) {
-
                     // DOUBLE CHECK 2: Live check.
-                    if (!isFullGroupSl) {
+                    if (!isFullGroupSl && !isNoPeakSl) {
                         let actualPairsToClose = [];
                         let liveCheckNet = 0;
 
@@ -580,13 +592,27 @@ const executeGlobalProfitMonitor = async () => {
                         finalPairsToClose = actualPairsToClose;
                         finalNetProfit = liveCheckNet;
 
-                        if (finalPairsToClose.length === 0) {
-                            triggerOffset = false;
+                        if (finalPairsToClose.length === 0) triggerOffset = false;
+                    } else if (isNoPeakSl) {
+                        // Soft Check for Lowest PNL (We want to close it even if it dropped further)
+                        let actualPairsToClose = [];
+                        let liveCheckNet = 0;
+                        for (let k = 0; k < finalPairsToClose.length; k++) {
+                            const pos = finalPairsToClose[k];
+                            const bState = activeBots.get(pos.profileId).state.coinStates[pos.symbol];
+                            const livePnl = bState ? (parseFloat(bState.unrealizedPnl) || 0) : pos.unrealizedPnl;
+                            
+                            actualPairsToClose.push(pos);
+                            liveCheckNet += livePnl;
                         }
+                        finalPairsToClose = actualPairsToClose;
+                        finalNetProfit = liveCheckNet;
+                        if (finalPairsToClose.length === 0) triggerOffset = false;
                     }
 
                     if (triggerOffset) {
-                        logForProfile(firstProfileId, `⚖️ SMART OFFSET V1 [${reason}]: Closing ${finalPairsToClose.length} WINNER coins. NET PROFIT OF CLOSURE: ${finalNetProfit >= 0 ? '+' : ''}$${finalNetProfit.toFixed(4)}`);
+                        const coinTypeLog = isNoPeakSl ? "LOWEST PNL" : "WINNER";
+                        logForProfile(firstProfileId, `⚖️ SMART OFFSET V1 [${reason}]: Closing ${finalPairsToClose.length} ${coinTypeLog} coin(s). NET PROFIT OF CLOSURE: ${finalNetProfit >= 0 ? '+' : ''}$${finalNetProfit.toFixed(4)}`);
                         
                         let totalWinnerPnl = 0;
 
@@ -607,8 +633,12 @@ const executeGlobalProfitMonitor = async () => {
                         }
 
                         OffsetRecord.create({
-                            userId: dbUserId, winnerSymbol: `Peak of ${finalPairsToClose.length} Winners`, winnerPnl: totalWinnerPnl,
-                            loserSymbol: `Ignored Loser Trades`, loserPnl: 0, netProfit: finalNetProfit
+                            userId: dbUserId, 
+                            winnerSymbol: isNoPeakSl ? 'Skipped' : `Peak of ${finalPairsToClose.length} Winners`, 
+                            winnerPnl: isNoPeakSl ? 0 : totalWinnerPnl,
+                            loserSymbol: isNoPeakSl ? finalPairsToClose[0].symbol : `Ignored Loser Trades`, 
+                            loserPnl: isNoPeakSl ? finalNetProfit : 0, 
+                            netProfit: finalNetProfit
                         }).catch(()=>{});
 
                         offsetExecuted = true;
@@ -656,7 +686,7 @@ const executeGlobalProfitMonitor = async () => {
                     
                     if (triggerOffset) {
                         let closeW = true;
-                        let closeL = false; // --- CHANGED: FORCE IGNORE LOSER ---
+                        let closeL = false; 
 
                         if (reason.includes("TAKE PROFIT V2")) {
                             const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
@@ -719,7 +749,7 @@ const executeGlobalProfitMonitor = async () => {
                     globalPnlPeaks.delete(dbUserId); 
                     
                     for (let pos of activeCandidates) {
-                        if (pos.unrealizedPnl <= 0) continue; // --- CHANGED: IGNORE LOSER TRADES ---
+                        if (pos.unrealizedPnl <= 0) continue; 
                         try {
                             const bData = activeBots.get(pos.profileId);
                             if (bData && bData.state.coinStates[pos.symbol]) {
@@ -1720,7 +1750,7 @@ app.get('/', (req, res) => {
 
                     const targetV1 = globalSet.smartOffsetNetProfit || 0;
                     const stopLossNth = globalSet.smartOffsetBottomRowV1StopLoss || 0; 
-                    const fullGroupSl = globalSet.smartOffsetStopLoss || 0; // Grab full group SL limit
+                    const fullGroupSl = globalSet.smartOffsetStopLoss || 0; 
                     const bottomRowN = globalSet.smartOffsetBottomRowV1 !== undefined ? globalSet.smartOffsetBottomRowV1 : 5;
 
                     if (totalPairs === 0) {
@@ -1754,14 +1784,14 @@ app.get('/', (req, res) => {
                         let topStatusMessage = '';
                         let executingPeak = false;
                         let executingSl = false;
+                        let executingNoPeakSl = false; 
                         
-                        const isHitNthSl = (stopLossNth < 0 && nthBottomAccumulation <= stopLossNth);
                         const isHitFullGroupSl = (fullGroupSl < 0 && runningAccumulation <= fullGroupSl);
 
                         if (targetV1 > 0 && peakAccumulation >= targetV1 && peakRowIndex >= 0) {
                             topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)}) (CLOSING WINNERS ONLY)!</span>\`;
                             executingPeak = true;
-                        } else if (isHitFullGroupSl) { // Nth Row SL no longer executes V1 SL, so we only check Full Group SL
+                        } else if (isHitFullGroupSl) { 
                             let projectedLoss = runningAccumulation; 
                             let blockedByLimit = false;
 
@@ -1775,6 +1805,9 @@ app.get('/', (req, res) => {
                                 executingSl = true;
                                 topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit (Full Group dropped to/below $\${fullGroupSl.toFixed(4)})! (CLOSING WINNERS ONLY)</span>\`;
                             }
+                        } else if (peakRowIndex === -1) {
+                            executingNoPeakSl = true;
+                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⚠️ No Peak Found! Ready to cut lowest PNL coin every 60s.</span>\`;
                         } else {
                             let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
                             topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
@@ -1802,6 +1835,12 @@ app.get('/', (req, res) => {
                                 else statusIcon = '⏸️ Ignored (Past Peak)';
                             } else if (executingSl) {
                                 statusIcon = '🔥 Executing SL (Winner Only)';
+                            } else if (executingNoPeakSl) {
+                                if (i === totalPairs - 1) { 
+                                    statusIcon = '🔥 Cutting Lowest PNL';
+                                } else {
+                                    statusIcon = '📉 Waiting for Peak';
+                                }
                             } else {
                                 if (i <= peakRowIndex) statusIcon = '📈 Part of Peak';
                                 else statusIcon = '📉 Dragging down';
@@ -1814,13 +1853,17 @@ app.get('/', (req, res) => {
 
                             let rowStyle = (i === peakRowIndex && peakAccumulation > 0) ? 'border: 2px solid #1e8e3e; background: #e6f4ea;' : '';
                             if (i === targetRefIndex) rowStyle += 'border-left: 4px solid #f29900;'; 
+                            
+                            // Highlighting the worst coin visually if executingNoPeakSl is true
+                            let loserCellStyle = '';
+                            if (executingNoPeakSl && i === totalPairs - 1) loserCellStyle = 'background: #fce8e6; border: 2px dashed #d93025;';
 
                             liveHtml += \`<tr style="\${rowStyle}">
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; color:#5f6368;">\${winnerIndex + 1} & \${loserIndex + 1} <br><span style="font-size:0.75em; color:#1a73e8">\${statusIcon}</span></td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500;">\${w.symbol}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${wColor}; font-weight:700;">\${w.pnl >= 0 ? '+' : ''}$\${w.pnl.toFixed(4)}</td>
-                                <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500;">\${l.symbol}</td>
-                                <td style="padding:12px; border-bottom:1px solid #eee; color:\${lColor}; font-weight:700;">\${l.pnl >= 0 ? '+' : ''}$\${l.pnl.toFixed(4)}</td>
+                                <td style="padding:12px; border-bottom:1px solid #eee; font-weight:500; \${loserCellStyle}">\${l.symbol}</td>
+                                <td style="padding:12px; border-bottom:1px solid #eee; color:\${lColor}; font-weight:700; \${loserCellStyle}">\${l.pnl >= 0 ? '+' : ''}$\${l.pnl.toFixed(4)}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${nColor}; font-weight:700; background: #f8f9fa;">\${net >= 0 ? '+' : ''}$\${net.toFixed(4)}</td>
                                 <td style="padding:12px; border-bottom:1px solid #eee; color:\${cColor}; font-weight:700; background: #e8f0fe;">
                                     \${displayAccumulation >= 0 ? '+' : ''}$\${displayAccumulation.toFixed(4)}
