@@ -112,7 +112,7 @@ global.globalPnlPeaks = global.globalPnlPeaks || new Map();
 global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
 global.rollingStopLosses = global.rollingStopLosses || new Map(); 
 global.autoDynamicExecutions = global.autoDynamicExecutions || new Map(); 
-global.walletHistory = global.walletHistory || new Map(); // Tracker for dynamic recovery
+global.walletHistory = global.walletHistory || new Map(); 
 
 const activeBots = global.activeBots;
 const globalPnlPeaks = global.globalPnlPeaks;
@@ -205,7 +205,6 @@ function startBot(userId, subAccount) {
 
                     const position = allPositions.find(p => p.symbol === coin.symbol && p.side === activeSide && p.contracts > 0);
 
-                    // OPEN BASE POSITION
                     if (!position) {
                         cState.avgEntry = 0; cState.contracts = 0; cState.currentRoi = 0; cState.unrealizedPnl = 0; cState.margin = 0;
                         const safeBaseQty = Math.max(1, Math.floor(currentSettings.baseQty));
@@ -218,7 +217,6 @@ function startBot(userId, subAccount) {
                         continue; 
                     }
 
-                    // UPDATE STATE MATH
                     cState.avgEntry = position.entryPrice;
                     cState.contracts = position.contracts;
                     
@@ -232,7 +230,6 @@ function startBot(userId, subAccount) {
                     cState.margin = margin;
                     cState.currentRoi = margin > 0 ? (unrealizedPnl / margin) * 100 : 0;
 
-                    // TP OR SL
                     const isTakeProfit = cState.currentRoi >= currentSettings.takeProfitPct;
                     const isStopLoss = currentSettings.stopLossPct < 0 && cState.currentRoi <= currentSettings.stopLossPct;
 
@@ -252,7 +249,6 @@ function startBot(userId, subAccount) {
                         continue; 
                     }
 
-                    // DCA TRIGGER
                     if (cState.currentRoi <= currentSettings.triggerRoiPct && (Date.now() - cState.lastDcaTime > 12000)) {
                         const reqQty = calculateDcaQty(activeSide, cState.avgEntry, cState.currentPrice, cState.contracts, currentSettings.leverage, currentSettings.dcaTargetRoiPct);
 
@@ -301,7 +297,6 @@ function stopBot(profileId) {
 // 4. BACKGROUND TASKS
 // =========================================================================
 
-// NEW: 1-Minute Live Wallet Tracker & Loss Calculator (STABLE BALANCE)
 const executeWalletTracker = async () => {
     try {
         await connectDB();
@@ -309,46 +304,71 @@ const executeWalletTracker = async () => {
         
         for (let userSetting of usersSettings) {
             const dbUserId = String(userSetting.userId);
-            let totalGlobalWalletBalance = 0;
+            let totalGlobalStableBalance = 0;
             let fetchedAny = false;
 
-            // Gather stable balances across all active subAccounts for this user
             for (let [profileId, botData] of activeBots.entries()) {
                 if (botData.userId !== dbUserId) continue;
                 try {
-                    const balanceData = await botData.exchange.fetchBalance();
-                    
-                    // CCXT standard: free (available) + used (locked in positions) = Stable Wallet Balance (No unrealized PNL)
-                    let stableBalance = 0;
-                    if (balanceData.USDT) {
-                        const free = balanceData.USDT.free || 0;
-                        const used = balanceData.USDT.used || 0;
-                        stableBalance = free + used;
-                    }
+                    const allMethods = Object.keys(botData.exchange);
+                    const v3Bal = allMethods.find(m => m.toLowerCase().includes('v3unifiedaccountinfo'));
+                    const v1Bal = allMethods.find(m => m.toLowerCase().includes('v1swapcrossaccountinfo'));
 
-                    // HTX specific raw info check (guarantees we get the exact stable balance)
-                    if (balanceData.info && balanceData.info.data) {
-                        const htxData = Array.isArray(balanceData.info.data) 
-                            ? balanceData.info.data.find(d => d.margin_asset === 'USDT') 
-                            : null;
-                        if (htxData && htxData.cross_margin_balance !== undefined) {
-                            stableBalance = parseFloat(htxData.cross_margin_balance);
+                    let totalEquity = 0;
+                    let balSuccess = false;
+
+                    try {
+                        const bal = await botData.exchange.fetchBalance({ type: 'swap', marginMode: 'cross' });
+                        if (bal?.total?.USDT !== undefined) {
+                            totalEquity = parseFloat(bal.total.USDT || 0);
+                            balSuccess = true;
                         }
+                    } catch(e) {}
+
+                    if (!balSuccess && v3Bal) {
+                        try {
+                            const rawV3 = await botData.exchange[v3Bal]({ trade_partition: 'USDT' });
+                            const d = Array.isArray(rawV3?.data) ? rawV3.data.find(x => x.margin_asset === 'USDT') || rawV3.data[0] : rawV3?.data;
+                            if (d) {
+                                totalEquity = parseFloat(d.margin_balance || d.cross_margin_balance || 0);
+                                balSuccess = true;
+                            }
+                        } catch(e) {}
                     }
 
-                    totalGlobalWalletBalance += stableBalance;
-                    fetchedAny = true;
-                } catch (err) {
-                    // Ignore transient network errors to avoid spam
-                }
+                    if (!balSuccess && v1Bal) {
+                        try {
+                            const rawCross = await botData.exchange[v1Bal]({ margin_account: 'USDT' });
+                            if (rawCross?.data?.[0]) {
+                                totalEquity = parseFloat(rawCross.data[0].margin_balance || 0);
+                                balSuccess = true;
+                            }
+                        } catch(e) {}
+                    }
+
+                    if (!balSuccess) continue; 
+
+                    let totalUnrealizedPnl = 0;
+                    try {
+                        const ccxtPos = await botData.exchange.fetchPositions(undefined, { marginMode: 'cross' });
+                        if (ccxtPos) {
+                            ccxtPos.forEach(p => { totalUnrealizedPnl += parseFloat(p.unrealizedPnl || 0); });
+                        }
+                    } catch(e) {}
+
+                    const staticWalletBalance = totalEquity - totalUnrealizedPnl;
+
+                    if (!isNaN(staticWalletBalance)) {
+                        totalGlobalStableBalance += staticWalletBalance;
+                        fetchedAny = true;
+                    }
+                } catch (err) {}
             }
 
             if (fetchedAny) {
                 let history = walletHistory.get(dbUserId) || [];
                 const now = Date.now();
-                history.push({ time: now, balance: totalGlobalWalletBalance });
-
-                // Keep only the last 60 minutes in memory max (to save space)
+                history.push({ time: now, balance: totalGlobalStableBalance });
                 history = history.filter(h => now - h.time <= 60 * 60 * 1000);
                 walletHistory.set(dbUserId, history);
             }
@@ -505,7 +525,7 @@ const executeGlobalProfitMonitor = async () => {
             const smartOffsetMaxLossTimeframeSeconds = parseInt(userSetting.smartOffsetMaxLossTimeframeSeconds) || 60;
             const timeframeMs = smartOffsetMaxLossTimeframeSeconds * 1000;
 
-            // WALLET RECOVERY LOGIC (Overrides V1 Target)
+            // WALLET RECOVERY LOGIC (Strict Target Override)
             const walletRecEnabled = userSetting.walletRecoveryEnabled || false;
             const walletRecMulti = parseFloat(userSetting.walletRecoveryMultiplier) || 1.5;
             const walletRecWindow = parseInt(userSetting.walletRecoveryWindowMinutes) || 5;
@@ -526,10 +546,8 @@ const executeGlobalProfitMonitor = async () => {
                         currentCalculatedLoss = maxBalance - currentBalance;
                         const recoveryTarget = currentCalculatedLoss * walletRecMulti;
                         
-                        // Dynamically override the target if the recovery target is higher than the base
-                        if (recoveryTarget > dynamicSmartOffsetNetProfit) {
-                            dynamicSmartOffsetNetProfit = recoveryTarget;
-                        }
+                        // STRICT OVERRIDE: If there is a loss, ignore base target and strictly use Loss * Multiplier
+                        dynamicSmartOffsetNetProfit = recoveryTarget;
                     }
                 }
             }
@@ -955,8 +973,8 @@ app.get('/api/status', authMiddleware, async (req, res) => {
 
     const autoDynExec = global.autoDynamicExecutions ? global.autoDynamicExecutions.get(dbUserId) : null;
 
-    // Wallet Recovery Data
-    let walletData = { balance: 0, loss: 0, recoveryTarget: 0, isRecovering: false };
+    // Wallet Recovery Data (Peak Tracking and Strict Target Calculation)
+    let walletData = { balance: 0, peak: 0, loss: 0, recoveryTarget: 0, isRecovering: false };
     if (settings && settings.walletRecoveryEnabled) {
         const history = walletHistory.get(dbUserId) || [];
         const windowMs = (settings.walletRecoveryWindowMinutes || 5) * 60 * 1000;
@@ -965,21 +983,20 @@ app.get('/api/status', authMiddleware, async (req, res) => {
         if (recentHistory.length > 0) {
             walletData.balance = recentHistory[recentHistory.length - 1].balance;
             const maxBalance = Math.max(...recentHistory.map(h => h.balance));
+            walletData.peak = maxBalance; 
             
             if (maxBalance > walletData.balance) {
                 walletData.loss = maxBalance - walletData.balance;
                 walletData.recoveryTarget = walletData.loss * (settings.walletRecoveryMultiplier || 1.5);
-                
-                // Set recovery state if recovery target overrides base target
-                if (walletData.recoveryTarget > (settings.smartOffsetNetProfit || 0)) {
-                    walletData.isRecovering = true;
-                }
+                walletData.isRecovering = true; // Always true if there is a loss, overriding base target
             }
         }
     } else {
-        // Just send latest balance if feature is off but data exists
         const history = walletHistory.get(dbUserId) || [];
-        if (history.length > 0) walletData.balance = history[history.length - 1].balance;
+        if (history.length > 0) {
+            walletData.balance = history[history.length - 1].balance;
+            walletData.peak = Math.max(...history.map(h => h.balance));
+        }
     }
 
     res.json({ 
@@ -1119,9 +1136,9 @@ app.get('/', (req, res) => {
                 <!-- GLOBAL STATS BANNER -->
                 <div class="status-box" style="background:#fff3e0; border-color:#ffe0b2; margin-bottom: 24px;">
                     <div class="flex-row" style="justify-content: space-between;">
-                        <div><span class="stat-label">Total Stable Wallet Balance (USDT)</span><span class="val" id="topGlobalWallet" style="color:#202124;">$0.0000</span></div>
-                        <div><span class="stat-label">Wallet Loss / Active Recovery Target</span><span class="val" id="topWalletRecovery" style="color:#f29900;">Disabled / Target Base</span></div>
-                        <div><span class="stat-label">Winning / Total Coins Trading</span><span class="val" id="globalWinRate" style="color:#e65100;">0 / 0</span></div>
+                        <div><span class="stat-label">Realized Stable Balance</span><span class="val" id="topGlobalWallet" style="color:#202124;">$0.0000</span></div>
+                        <div><span class="stat-label">Tracked Wallet Peak</span><span class="val" id="topWalletPeak" style="color:#1a73e8;">$0.0000</span></div>
+                        <div><span class="stat-label">Recovery Target (Loss &times; Multiplier)</span><span class="val" id="topWalletRecovery" style="color:#f29900;">Disabled</span></div>
                         <div><span class="stat-label">Global Unrealized PNL ($)</span><span class="val" id="topGlobalUnrealized">0.0000000000</span></div>
                     </div>
                 </div>
@@ -1144,10 +1161,10 @@ app.get('/', (req, res) => {
                             <!-- WALLET RECOVERY SETTINGS -->
                             <div style="margin-bottom: 16px; border-bottom: 1px solid #cce0ff; padding-bottom: 16px;">
                                 <h4 style="margin: 0 0 8px 0; color: #d93025; display:flex; align-items:center;">
-                                    Live Wallet Peak Recovery
+                                    Live Wallet Peak Recovery (V1 Target Override)
                                     <input type="checkbox" id="walletRecoveryEnabled" style="width:auto; margin-left:12px; margin-right:4px;"> Enable
                                 </h4>
-                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Tracks your Realized Stable Wallet Balance over a rolling window. If it drops from the peak (meaning a Stop Loss occurred), it overrides the Smart Offset V1 Target below with [Loss * Multiplier] to dynamically win back exactly what you lost using the V1 Group Accumulation Peak.</p>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Tracks your Realized Stable Wallet Balance over a rolling window. If your balance drops below your peak (Stop Loss occurred), it completely ignores your base target below and strictly forces the V1 Group Peak Target to <strong>[Loss * Multiplier]</strong> to recover your money.</p>
                                 <div class="flex-row">
                                     <div style="flex:1;">
                                         <label style="margin-top:0;">Loss Recovery Multiplier</label>
@@ -1173,8 +1190,8 @@ app.get('/', (req, res) => {
                                 </div>
                             </div>
                             <div style="margin-top: 12px;">
-                                <label style="margin-top:0;">Manual Offset Net Profit Target V1 ($)</label>
-                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Groups Pair 1 + Pair 2 + Pair 3 etc. Closes the entire bucket of coins if the cumulative Group Net PNL >= this amount.</p>
+                                <label style="margin-top:0;">Manual Offset Net Profit Base Target V1 ($)</label>
+                                <p style="font-size:0.75em; color:#5f6368; margin-top:2px; line-height:1.4;">Used only when Recovery is disabled or NO loss exists. Groups Pair 1 + Pair 2 + Pair 3 etc. Closes the entire bucket of coins if the cumulative Group Net PNL >= this amount.</p>
                                 <input type="number" step="0.1" id="smartOffsetNetProfit" placeholder="e.g. 1.00 (0 = Disabled)">
                             </div>
                             <div style="margin-top: 12px;">
@@ -1693,7 +1710,7 @@ app.get('/', (req, res) => {
                 const subAccountsUpdated = data.subAccounts || [];
                 const globalSet = data.globalSettings || {};
                 const currentMinuteLoss = data.currentMinuteLoss || 0;
-                const walletData = data.walletData || { balance: 0, loss: 0, recoveryTarget: 0, isRecovering: false };
+                const walletData = data.walletData || { balance: 0, peak: 0, loss: 0, recoveryTarget: 0, isRecovering: false };
 
                 let globalTotal = 0;
                 subAccountsUpdated.forEach(sub => {
@@ -1724,17 +1741,20 @@ app.get('/', (req, res) => {
                     }
                 }
 
-                // Update Wallet Banner
+                // Update Wallet Banner (Explicit Formulas)
                 document.getElementById('topGlobalWallet').innerText = '$' + walletData.balance.toFixed(4);
+                document.getElementById('topWalletPeak').innerText = '$' + walletData.peak.toFixed(4);
+                
                 const recEl = document.getElementById('topWalletRecovery');
                 if (globalSet.walletRecoveryEnabled) {
-                    if (walletData.isRecovering) {
-                        recEl.innerHTML = \`<span style="color:#d93025;">Loss: $\${walletData.loss.toFixed(4)}</span> / <span style="color:#1e8e3e; font-weight:bold;">Target: $\${walletData.recoveryTarget.toFixed(4)}</span>\`;
+                    if (walletData.loss > 0) {
+                        const multi = globalSet.walletRecoveryMultiplier || 1.5;
+                        recEl.innerHTML = \`<span style="color:#d93025;">$ \${walletData.loss.toFixed(4)}</span> &times; \${multi} = <span style="color:#1e8e3e; font-weight:bold;">$ \${walletData.recoveryTarget.toFixed(4)}</span>\`;
                     } else {
-                        recEl.innerHTML = \`<span style="color:#1e8e3e;">No Loss</span> / Target Base ($\${(globalSet.smartOffsetNetProfit || 0).toFixed(4)})\`;
+                        recEl.innerHTML = \`<span style="color:#1e8e3e;">No Loss</span> (Base Target: $ \${(globalSet.smartOffsetNetProfit || 0).toFixed(4)})\`;
                     }
                 } else {
-                    recEl.innerText = "Disabled / Target Base";
+                    recEl.innerText = "Disabled";
                     recEl.style.color = "#5f6368";
                 }
 
@@ -1846,9 +1866,9 @@ app.get('/', (req, res) => {
                     const totalCoins = activeCandidates.length;
                     const totalPairs = Math.floor(totalCoins / 2);
 
-                    // Grab dynamic target considering wallet recovery
+                    // Grab strict override target 
                     let activeTargetV1 = globalSet.smartOffsetNetProfit || 0;
-                    if (walletData.isRecovering) {
+                    if (globalSet.walletRecoveryEnabled && walletData.loss > 0) {
                         activeTargetV1 = walletData.recoveryTarget;
                     }
 
@@ -1915,7 +1935,7 @@ app.get('/', (req, res) => {
                         } else {
                             let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
                             let targetInfo = \`$\${activeTargetV1.toFixed(4)}\`;
-                            if(walletData.isRecovering) targetInfo += \` (🔥 Recovery)\`;
+                            if(globalSet.walletRecoveryEnabled && walletData.loss > 0) targetInfo += \` (🔥 Forced Recovery Override)\`;
                             
                             topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; \${targetInfo}</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
                         }
@@ -1964,9 +1984,16 @@ app.get('/', (req, res) => {
                         }
                         liveHtml += '</table>';
                         
+                        // Explicit Target Display Logic
+                        let targetUiString = \`🎯 Base Target: $\${activeTargetV1.toFixed(4)}\`;
+                        if (globalSet.walletRecoveryEnabled && walletData.loss > 0) {
+                            const multi = globalSet.walletRecoveryMultiplier || 1.5;
+                            targetUiString = \`🎯 RECOVERY TARGET: $\${walletData.loss.toFixed(4)} (Loss) &times; \${multi} = <strong style="color:#d93025;">$\${activeTargetV1.toFixed(4)}</strong>\`;
+                        }
+
                         let dynamicInfoHtml = \`<div style="margin-bottom: 12px; padding: 12px; background: #e8f0fe; border: 1px solid #cce0ff; border-radius: 6px; color: #1a73e8; font-weight: 500;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                                <div>🎯 Target (Overrides if Recovery): $\${activeTargetV1.toFixed(4)} \${walletData.isRecovering ? '<span style="color:#d93025; font-size:0.8em;">(Recovering)</span>' : ''}</div>
+                                <div>\${targetUiString}</div>
                                 <div>🛑 Full Group Stop: $\${fullGroupSl.toFixed(4)}</div>
                                 <div>🛑 Row \${bottomRowN} Stop: $\${stopLossNth.toFixed(4)}</div>
                             </div>
