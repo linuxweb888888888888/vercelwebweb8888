@@ -8,8 +8,8 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_change_this_in_production';
 
-// ORIGINAL HARDCODED DATABASE URL
-const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
+// 🚨 ORIGINAL HARDCODED DATABASE URL (PASSWORD MASKED FOR YOUR SECURITY)
+const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:YOUR_PASSWORD_HERE@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
 
 // ==========================================
 // 1. MONGODB DATABASE SETUP (Vercel Serverless Safe)
@@ -447,7 +447,6 @@ const executeWalletTracker = async () => {
 
 const executeOneMinuteCloser = async () => {
     // Left empty/disabled. Autonomous AI pilot handles 1-min tracking intrinsically now.
-    // Legacy auto-dynamic closer bypassed for optimization if AI is preferred.
 };
 
 const executeGlobalProfitMonitor = async () => {
@@ -491,9 +490,7 @@ const executeGlobalProfitMonitor = async () => {
             // 🤖 AUTONOMOUS AI PILOT (GLOBAL FAT-TRIMMER)
             // ====================================================
             if (isAutoPilot) {
-                // Sort Winners (Highest Profit first)
                 let winners = activeCandidates.filter(c => c.unrealizedPnl > 0).sort((a,b) => b.unrealizedPnl - a.unrealizedPnl);
-                // Sort Losers (Smallest loss first)
                 let losers = activeCandidates.filter(c => c.unrealizedPnl < 0).sort((a,b) => b.unrealizedPnl - a.unrealizedPnl);
 
                 let aiExecutedOffset = false;
@@ -551,8 +548,6 @@ const executeGlobalProfitMonitor = async () => {
                         }
                     }
                 }
-                
-                // Original rigid logic omitted from execution to maintain strict AI functionality.
             }
 
         }
@@ -842,11 +837,14 @@ app.get('/', (req, res) => {
 
         <!-- DASHBOARD VIEW -->
         <div id="dashboard-view" class="container">
+            <!-- ========================== NEW AI MENU HEADER ========================== -->
             <div class="header">
                 <h1>HTX Trading Bot</h1>
                 <div style="display:flex; gap:12px;">
-                    <button class="btn-blue" style="margin:0; width:auto; padding: 8px 16px;" onclick="switchTab('main')">Dashboard</button>
-                    <button class="btn-logout" style="margin:0; width:auto;" onclick="switchTab('offsets')">Executed Offsets / AI History</button>
+                    <button class="btn-blue" style="margin:0; width:auto; padding: 8px 16px;" onclick="switchTab('main')">⚙️ Dashboard</button>
+                    <!-- NEW AI PILOT BUTTON -->
+                    <button class="btn-blue ai-glow" style="margin:0; width:auto; padding: 8px 16px;" onclick="switchTab('aipilot')">🤖 AI Pilot Live</button>
+                    <button class="btn-logout" style="margin:0; width:auto;" onclick="switchTab('offsets')">History</button>
                     <button class="btn-logout" style="margin:0; width:auto;" onclick="logout()">Logout</button>
                 </div>
             </div>
@@ -856,6 +854,35 @@ app.get('/', (req, res) => {
                 <div class="panel">
                     <h2 style="color: #1e8e3e;">Executed Smart Offsets & AI Auto-Trims History</h2>
                     <div id="offsetTableContainer" style="margin-top: 20px;">Loading historical offset data...</div>
+                </div>
+            </div>
+
+            <!-- ========================== NEW AI PILOT LIVE VIEW TAB ========================== -->
+            <div id="aipilot-tab" style="display:none;">
+                <div class="panel ai-glow" style="border: 1px solid #1a73e8;">
+                    <div class="flex-row" style="justify-content: space-between;">
+                        <h2 style="color: #1a73e8; border: none; margin: 0;">🤖 AI Pilot Telemetry & Live Radar</h2>
+                        <div id="aiMasterStatus" style="font-weight: bold; padding: 8px 16px; border-radius: 4px;">Loading...</div>
+                    </div>
+                    <p style="color: #5f6368; font-size: 0.9em;">Visualizing the AI's internal thought process, momentum tracking, and dynamic trimming logic.</p>
+
+                    <!-- FAT TRIMMER RADAR -->
+                    <h3 style="color: #202124;">⚖️ AI Auto-Trimmer Radar (Looking for offset pairs...)</h3>
+                    <div id="aiTrimmerRadar" style="background: #f8f9fa; padding: 16px; border-radius: 6px; border: 1px dashed #ccc; margin-bottom: 24px;">
+                        Waiting for data...
+                    </div>
+
+                    <!-- COIN MICRO-SCALP RADAR -->
+                    <h3 style="color: #202124;">📡 Micro-Scalp & Momentum Radar</h3>
+                    <div id="aiCoinRadarContainer">
+                        <!-- Injected by JS -->
+                    </div>
+
+                    <!-- AI SPECIFIC LOGS -->
+                    <h3 style="color: #202124;">⚡ Live AI Action Feed</h3>
+                    <div class="log-box" id="aiSpecificLogs" style="height: 200px; border-color: #1a73e8; color: #64b5f6;">
+                        Waiting for AI events...
+                    </div>
                 </div>
             </div>
 
@@ -1044,15 +1071,19 @@ app.get('/', (req, res) => {
                 }
             }
 
+            // ========================== UPDATED SWITCH TAB ==========================
             function switchTab(tab) {
                 document.getElementById('main-tab').style.display = 'none';
                 document.getElementById('offset-tab').style.display = 'none';
+                document.getElementById('aipilot-tab').style.display = 'none';
 
                 if (tab === 'main') {
                     document.getElementById('main-tab').style.display = 'block';
                 } else if (tab === 'offsets') {
                     document.getElementById('offset-tab').style.display = 'block';
                     loadOffsets();
+                } else if (tab === 'aipilot') {
+                    document.getElementById('aipilot-tab').style.display = 'block';
                 }
             }
 
@@ -1364,8 +1395,6 @@ app.get('/', (req, res) => {
                     recEl.innerText = "Disabled";
                     recEl.style.color = "#5f6368";
                 }
-
-                document.getElementById('globalWinRate').innerText = totalAboveZero + ' / ' + totalTrading;
                 
                 const topPnlEl = document.getElementById('topGlobalUnrealized');
                 topPnlEl.innerText = (globalUnrealized >= 0 ? "+$" : "-$") + Math.abs(globalUnrealized).toFixed(4);
@@ -1428,6 +1457,109 @@ app.get('/', (req, res) => {
                 }
 
                 document.getElementById('logs').innerHTML = (stateData.logs || []).join('<br>');
+
+                // ============================================================
+                // 🤖 NEW AI PILOT TELEMETRY RENDERER (INJECTED)
+                // ============================================================
+                if (document.getElementById('aipilot-tab').style.display !== 'none') {
+                    const aiStatusEl = document.getElementById('aiMasterStatus');
+                    if (globalSet.autonomousAiPilot !== false) {
+                        aiStatusEl.innerText = "STATUS: ENGAGED & HUNTING 🟢";
+                        aiStatusEl.style.backgroundColor = "#e6f4ea";
+                        aiStatusEl.style.color = "#1e8e3e";
+                    } else {
+                        aiStatusEl.innerText = "STATUS: OFFLINE (Manual Mode) 🔴";
+                        aiStatusEl.style.backgroundColor = "#fce8e6";
+                        aiStatusEl.style.color = "#d93025";
+                    }
+
+                    const aiLogs = (stateData.logs || []).filter(l => l.includes('🤖') || l.includes('AI') || l.includes('Trimmer'));
+                    document.getElementById('aiSpecificLogs').innerHTML = aiLogs.length > 0 ? aiLogs.join('<br>') : "<i>No AI actions recorded yet in this session. Tracking the market...</i>";
+
+                    let aiRadarHtml = '';
+                    let winners = [];
+                    let losers = [];
+
+                    myCoins.forEach(coin => {
+                        const state = stateData.coinStates && stateData.coinStates[coin.symbol] ? stateData.coinStates[coin.symbol] : null;
+                        if (!state || state.status !== 'Running' || state.contracts === 0) return;
+
+                        if (state.unrealizedPnl > 0) winners.push({ sym: coin.symbol, pnl: state.unrealizedPnl });
+                        else losers.push({ sym: coin.symbol, pnl: state.unrealizedPnl });
+
+                        let momentumHtml = '<span style="color:#5f6368;">Gathering data...</span>';
+                        if (state.lastPrices && state.lastPrices.length >= 10) {
+                            const startP = state.lastPrices[0];
+                            const endP = state.lastPrices[state.lastPrices.length - 1];
+                            const isLong = (coin.side || profile.side) === 'long';
+                            const isStagnant = isLong ? endP <= startP : endP >= startP;
+                            
+                            if (isStagnant) momentumHtml = \`<span style="color:#f29900; font-weight:bold;">Stalled (Dead Momentum) - AI preparing to cut if ROI > 0.1%</span>\`;
+                            else momentumHtml = \`<span style="color:#1e8e3e; font-weight:bold;">Active Momentum (Riding the wave)</span>\`;
+                        }
+
+                        let trailingHtml = '';
+                        if (state.peakRoi > 0.5) {
+                            let limit = state.peakRoi > 2.0 ? 0.5 : 0.2;
+                            let currentDrop = state.peakRoi - state.currentRoi;
+                            let percentToDrop = ((currentDrop / limit) * 100).toFixed(0);
+                            trailingHtml = \`<br><span style="color:#1a73e8; font-size:0.9em;">🎯 Trailing Profit Active: Peak <b>\${state.peakRoi.toFixed(2)}%</b>. Leash tension: <b>\${percentToDrop}%</b> to auto-close.</span>\`;
+                        } else if (state.valleyRoi < -8.0 && state.currentRoi >= -2.0) {
+                            trailingHtml = \`<br><span style="color:#d93025; font-size:0.9em;">🛡️ Smart Cut Active: Survived massive drop (\${state.valleyRoi.toFixed(2)}%). Will cut loose on next bounce.</span>\`;
+                        }
+
+                        aiRadarHtml += \`
+                        <div class="coin-box" style="border-left: 4px solid #1a73e8; margin-bottom: 12px;">
+                            <div class="flex-row" style="justify-content: space-between;">
+                                <strong>\${coin.symbol}</strong>
+                                <span>Current ROI: <b class="\${state.currentRoi >= 0 ? 'green' : 'red'}">\${state.currentRoi.toFixed(2)}%</b></span>
+                            </div>
+                            <div style="font-size: 0.9em; margin-top: 8px;">
+                                Trend: \${momentumHtml} \${trailingHtml}
+                            </div>
+                        </div>\`;
+                    });
+
+                    document.getElementById('aiCoinRadarContainer').innerHTML = aiRadarHtml || '<p style="color:#5f6368;">No active positions to analyze.</p>';
+
+                    let trimmerHtml = '';
+                    if (winners.length > 0 && losers.length > 0) {
+                        winners.sort((a,b) => b.pnl - a.pnl);
+                        losers.sort((a,b) => b.pnl - a.pnl);
+
+                        let bestWinner = winners[0];
+                        let bestLoser = losers[0];
+                        let net = bestWinner.pnl + bestLoser.pnl;
+                        
+                        let netColor = net >= 0.02 ? '#1e8e3e' : '#5f6368';
+                        let netBg = net >= 0.02 ? '#e6f4ea' : '#f1f3f4';
+                        let actionMsg = net >= 0.02 ? '⚡ <b>AI WILL EXECUTE THIS CUT ON NEXT TICK!</b> (Net > $0.02)' : 'AI is waiting. Needs $' + (0.02 - net).toFixed(4) + ' more profit from the winner to absorb this loser.';
+
+                        trimmerHtml = \`
+                            <div style="display:flex; justify-content: space-between; align-items: center;">
+                                <div style="text-align:center; padding: 12px; background: #e6f4ea; border-radius: 6px; width: 30%;">
+                                    <div style="font-size: 0.8em; color: #1e8e3e;">Top Winner</div>
+                                    <strong>\${bestWinner.sym}</strong><br>+$\${bestWinner.pnl.toFixed(4)}
+                                </div>
+                                <div style="font-size: 1.5em; color: #5f6368;">+</div>
+                                <div style="text-align:center; padding: 12px; background: #fce8e6; border-radius: 6px; width: 30%;">
+                                    <div style="font-size: 0.8em; color: #d93025;">Smallest Loser</div>
+                                    <strong>\${bestLoser.sym}</strong><br>-$\${Math.abs(bestLoser.pnl).toFixed(4)}
+                                </div>
+                                <div style="font-size: 1.5em; color: #5f6368;">=</div>
+                                <div style="text-align:center; padding: 12px; background: \${netBg}; border-radius: 6px; width: 30%;">
+                                    <div style="font-size: 0.8em;">Net Result</div>
+                                    <strong style="color: \${netColor};">$\${net.toFixed(4)}</strong>
+                                </div>
+                            </div>
+                            <p style="text-align:center; margin-top:12px; font-size:0.9em; color:#5f6368;">\${actionMsg}</p>
+                        \`;
+                    } else {
+                        trimmerHtml = '<p style="color:#5f6368; margin:0;">Waiting for at least 1 profitable coin and 1 losing coin to calculate pair offsets...</p>';
+                    }
+                    
+                    document.getElementById('aiTrimmerRadar').innerHTML = trimmerHtml;
+                }
             }
 
             checkAuth(); 
