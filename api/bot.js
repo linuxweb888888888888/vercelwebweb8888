@@ -108,7 +108,7 @@ global.globalPnlPeaks = global.globalPnlPeaks || new Map();
 global.lastStopLossExecutions = global.lastStopLossExecutions || new Map(); 
 global.rollingStopLosses = global.rollingStopLosses || new Map(); 
 global.autoDynamicExecutions = global.autoDynamicExecutions || new Map(); 
-global.lastNoPeakSlExecutions = global.lastNoPeakSlExecutions || new Map(); // Tracks the "Lowest PNL" 1-min interval
+global.lastNoPeakSlExecutions = global.lastNoPeakSlExecutions || new Map(); 
 
 const activeBots = global.activeBots;
 const globalPnlPeaks = global.globalPnlPeaks;
@@ -514,7 +514,7 @@ const executeGlobalProfitMonitor = async () => {
                 
                 const isFullGroupSl = (smartOffsetStopLoss < 0 && runningAccumulation <= smartOffsetStopLoss);
 
-                if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation > 0 && peakRowIndex >= 0) {
+                if (smartOffsetNetProfit > 0 && peakAccumulation >= targetV1 && peakAccumulation >= 0.0001 && peakRowIndex >= 0) {
                     triggerOffset = true;
                     reason = `TAKE PROFIT (Harvested Peak at Row ${peakRowIndex + 1}, Target: $${targetV1.toFixed(4)})`;
                     
@@ -550,8 +550,8 @@ const executeGlobalProfitMonitor = async () => {
                         }
                     }
                 }
-                // Stop Loss (NO PEAK FOUND -> Lowest PNL Coin)
-                else if (peakRowIndex === -1) {
+                // Stop Loss (NO PEAK FOUND <= 0.0000 -> Lowest PNL Coin)
+                else if (peakRowIndex === -1 || peakAccumulation < 0.0001) {
                     let allowNoPeakSl = false;
                     if (Date.now() - (lastNoPeakSlExecutions.get(dbUserId) || 0) >= 60000) allowNoPeakSl = true;
 
@@ -1657,7 +1657,7 @@ app.get('/', (req, res) => {
                         rAcc += sortedCands[i].pnl + sortedCands[tCoins - tPairs + i].pnl;
                         if (rAcc > peakAccumulation) peakAccumulation = rAcc;
                     }
-                    if (peakAccumulation > 0) hasDynamicBoundary = true;
+                    if (peakAccumulation >= 0.0001) hasDynamicBoundary = true;
                 }
 
                 const autoDynCheckbox = document.getElementById('minuteCloseAutoDynamic');
@@ -1788,7 +1788,7 @@ app.get('/', (req, res) => {
                         
                         const isHitFullGroupSl = (fullGroupSl < 0 && runningAccumulation <= fullGroupSl);
 
-                        if (targetV1 > 0 && peakAccumulation >= targetV1 && peakRowIndex >= 0) {
+                        if (targetV1 > 0 && peakAccumulation >= targetV1 && peakAccumulation >= 0.0001 && peakRowIndex >= 0) {
                             topStatusMessage = \`<span style="color:#1e8e3e; font-weight:bold;">🔥 Target Reached! Slicing at Row \${peakRowIndex + 1} to harvest Peak Profit ($\${peakAccumulation.toFixed(4)}) (CLOSING WINNERS ONLY)!</span>\`;
                             executingPeak = true;
                         } else if (isHitFullGroupSl) { 
@@ -1805,11 +1805,11 @@ app.get('/', (req, res) => {
                                 executingSl = true;
                                 topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">🔥 Stop Loss Hit (Full Group dropped to/below $\${fullGroupSl.toFixed(4)})! (CLOSING WINNERS ONLY)</span>\`;
                             }
-                        } else if (peakRowIndex === -1) {
+                        } else if (peakRowIndex === -1 || peakAccumulation < 0.0001) {
                             executingNoPeakSl = true;
-                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⚠️ No Peak Found! Ready to cut lowest PNL coin every 60s.</span>\`;
+                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⚠️ No Peak Found (&le; $0.0000)! Ready to cut lowest PNL coin every 60s.</span>\`;
                         } else {
-                            let pColor = peakAccumulation > 0 ? '#1e8e3e' : '#5f6368';
+                            let pColor = peakAccumulation >= 0.0001 ? '#1e8e3e' : '#5f6368';
                             topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
                         }
 
@@ -1842,7 +1842,7 @@ app.get('/', (req, res) => {
                                     statusIcon = '📉 Waiting for Peak';
                                 }
                             } else {
-                                if (i <= peakRowIndex) statusIcon = '📈 Part of Peak';
+                                if (i <= peakRowIndex && peakAccumulation >= 0.0001) statusIcon = '📈 Part of Peak';
                                 else statusIcon = '📉 Dragging down';
                             }
 
@@ -1851,7 +1851,7 @@ app.get('/', (req, res) => {
                             const nColor = net >= 0 ? '#1e8e3e' : '#d93025';
                             const cColor = displayAccumulation >= 0 ? '#1e8e3e' : '#d93025';
 
-                            let rowStyle = (i === peakRowIndex && peakAccumulation > 0) ? 'border: 2px solid #1e8e3e; background: #e6f4ea;' : '';
+                            let rowStyle = (i === peakRowIndex && peakAccumulation >= 0.0001) ? 'border: 2px solid #1e8e3e; background: #e6f4ea;' : '';
                             if (i === targetRefIndex) rowStyle += 'border-left: 4px solid #f29900;'; 
                             
                             // Highlighting the worst coin visually if executingNoPeakSl is true
