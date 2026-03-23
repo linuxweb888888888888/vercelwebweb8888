@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_change_this_in_production';
 
 // 🚨 ORIGINAL HARDCODED DATABASE URL (PASSWORD MASKED FOR YOUR SECURITY)
-const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:YOUR_PASSWORD_HERE@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
+const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
 
 // ==========================================
 // 1. MONGODB DATABASE SETUP (Vercel Serverless Safe)
