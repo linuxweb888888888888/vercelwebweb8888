@@ -185,7 +185,10 @@ async function startBot(userId, subAccount) {
         }
         
         const currentSettings = botData.settings;
-        const activeCoins = currentSettings.coins.filter(c => c.botActive);
+        
+        // FORCE all coins to be active so they never stop processing
+        currentSettings.coins.forEach(c => c.botActive = true); 
+        const activeCoins = currentSettings.coins;
 
         if (activeCoins.length === 0) {
             isProcessing = false;
@@ -226,9 +229,11 @@ async function startBot(userId, subAccount) {
                     if (!ticker || !ticker.last) continue; 
                     
                     cState.currentPrice = ticker.last;
-                    const activeSide = coin.side || currentSettings.side;
-
-                    const position = allPositions.find(p => p.symbol === coin.symbol && p.side === activeSide && p.contracts > 0);
+                    
+                    // AUTO-DETECT SIDE FROM EXCHANGE to prevent ignored "ghost" positions
+                    let position = allPositions.find(p => p.symbol === coin.symbol && p.contracts > 0);
+                    const activeSide = position && position.side ? position.side : (coin.side || currentSettings.side);
+                    cState.activeSide = activeSide; // Store for background tasks
 
                     // OPEN BASE POSITION
                     if (!position) {
@@ -353,7 +358,7 @@ const executeOneMinuteCloser = async () => {
                             profileId, symbol, exchange: botData.exchange,
                             pnl: parseFloat(cState.unrealizedPnl) || 0,
                             contracts: cState.contracts,
-                            side: botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side,
+                            side: cState.activeSide || botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side,
                             subAccount: botData.settings,
                             cState: cState
                         });
@@ -506,7 +511,7 @@ const executeGlobalProfitMonitor = async () => {
                         const pnl = parseFloat(cState.unrealizedPnl) || 0;
                         globalUnrealized += pnl;
                         
-                        const activeSide = botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side;
+                        const activeSide = cState.activeSide || botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side;
                         
                         let activeLeverage = botData.settings.leverage;
                         try {
@@ -848,7 +853,7 @@ const bootstrapBots = async () => {
             const activeSettings = await Settings.find({});
             activeSettings.forEach(s => {
                 if (s.subAccounts) {
-                    s.subAccounts.forEach(sub => { if (sub.coins && sub.coins.some(c => c.botActive)) startBot(s.userId.toString(), sub); });
+                    s.subAccounts.forEach(sub => { if (sub.coins && sub.coins.length > 0) startBot(s.userId.toString(), sub); });
                 }
             });
         } catch(e) {}
@@ -970,7 +975,7 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
         updated.subAccounts.forEach(sub => {
             const profileId = sub._id.toString();
             activeSubIds.push(profileId);
-            if (sub.coins && sub.coins.some(c => c.botActive)) {
+            if (sub.coins && sub.coins.length > 0) {
                 if (activeBots.has(profileId)) activeBots.get(profileId).settings = sub;
                 else startBot(req.userId.toString(), sub);
             } else {
