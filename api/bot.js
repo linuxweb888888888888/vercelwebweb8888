@@ -124,6 +124,9 @@ const ProfileState = mongoose.models.ProfileState || mongoose.model('ProfileStat
 global.activeBots = global.activeBots || new Map();
 const activeBots = global.activeBots;
 
+// Global Cache for Maximum Discovered Leverage per Coin
+global.maxLeverageCache = global.maxLeverageCache || new Map();
+
 function logForProfile(profileId, msg) {
     console.log(`[Profile: ${profileId}] ${msg}`);
     const bot = activeBots.get(profileId);
@@ -148,53 +151,46 @@ function calculateDcaQty(side, P0, Pc, C0, leverage, targetRoiPct) {
 }
 
 // ------------------------------------------------------------------------
-// AGGRESSIVE HTX MAX LEVERAGE ENFORCER (Bypasses Manual Settings)
+// AGGRESSIVE ACTIVE MAX LEVERAGE DISCOVERY
+// Test tiers from highest to lowest. The first one HTX accepts is the true max.
 // ------------------------------------------------------------------------
-function getMaxLeverage(exchange, symbol) {
-    let maxL = 0;
-    try {
-        const market = exchange.market(symbol);
-        if (market) {
-            if (market.limits && market.limits.leverage && market.limits.leverage.max) {
-                maxL = market.limits.leverage.max;
-            }
-            if (market.info) {
-                const keys = ['lever_rate', 'cross_lever_rate', 'max_lever_rate', 'available_level_rate', 'maxLeverage'];
-                for (let k of keys) {
-                    if (market.info[k] !== undefined) {
-                        const str = String(market.info[k]);
-                        const vals = str.split(',').map(Number).filter(n => !isNaN(n));
-                        if (vals.length > 0) maxL = Math.max(maxL, ...vals);
-                    }
+async function applyMaxLeverage(exchange, symbol, profileId) {
+    if (global.maxLeverageCache.has(symbol)) {
+        const cachedLev = global.maxLeverageCache.get(symbol);
+        try { await exchange.setLeverage(cachedLev, symbol, { marginMode: 'cross' }); } catch(e) {}
+        return cachedLev;
+    }
+
+    const tiersToTry = [200, 150, 125, 100, 75, 50, 20, 10];
+    let foundMax = 10;
+
+    for (let lev of tiersToTry) {
+        try {
+            // Attempt standard CCXT
+            await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
+            foundMax = lev;
+            break; // If no error is thrown, the exchange accepted it! We found the ceiling.
+        } catch (e) {
+            try {
+                // Attempt direct HTX Internal API fallback just in case
+                const market = exchange.market(symbol);
+                if (market && market.id) {
+                    await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
+                        contract_code: market.id,
+                        lever_rate: lev
+                    });
+                    foundMax = lev;
+                    break;
                 }
+            } catch (e2) {
+                // Denied. Move to the next lower tier.
             }
         }
-    } catch(e) {}
-    
-    // Fallback safely if CCXT fails to load the max info
-    if (maxL === 0) {
-        if (symbol.includes('BTC') || symbol.includes('ETH')) maxL = 100;
-        else maxL = 50; 
     }
-    return maxL;
-}
 
-async function forceSetLeverage(exchange, symbol, lev) {
-    try {
-        // Standard CCXT
-        await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
-    } catch (e) {
-        try {
-            // Direct HTX Override (Hits their hidden internal API for open positions)
-            const market = exchange.market(symbol);
-            if (market && market.linear) {
-                await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
-                    contract_code: market.id,
-                    lever_rate: lev
-                });
-            }
-        } catch (e2) {}
-    }
+    global.maxLeverageCache.set(symbol, foundMax);
+    logForProfile(profileId, `⚡ [LEVERAGE DISCOVERY] Locked true maximum leverage for ${symbol} at ${foundMax}x`);
+    return foundMax;
 }
 // ------------------------------------------------------------------------
 
@@ -256,9 +252,8 @@ async function startBot(userId, subAccount) {
 
             for (let coin of activeCoins) {
                 try {
-                    // Extract True Max Leverage (Ignoring Manual) & Force it on Exchange
-                    const activeLeverage = getMaxLeverage(exchange, coin.symbol);
-                    await forceSetLeverage(exchange, coin.symbol, activeLeverage);
+                    // Extract True Max Leverage by aggressively testing exchange limits
+                    const activeLeverage = await applyMaxLeverage(exchange, coin.symbol, profileId);
 
                     if (!state.coinStates[coin.symbol]) {
                         state.coinStates[coin.symbol] = { status: 'Running', currentPrice: 0, avgEntry: 0, contracts: 0, currentRoi: 0, unrealizedPnl: 0, margin: 0, lastDcaTime: 0, lockUntil: 0 };
@@ -484,8 +479,7 @@ const executeOneMinuteCloser = async () => {
                         cw.cState.contracts = 0; cw.cState.unrealizedPnl = 0; cw.cState.currentRoi = 0;
                         const cwOrderSide = cw.side === 'long' ? 'sell' : 'buy';
                         
-                        const activeLeverage = getMaxLeverage(cw.exchange, cw.symbol);
-                        await forceSetLeverage(cw.exchange, cw.symbol, activeLeverage);
+                        const activeLeverage = global.maxLeverageCache.get(cw.symbol) || await applyMaxLeverage(cw.exchange, cw.symbol, cw.profileId);
                         cw.exchange.createOrder(cw.symbol, 'market', cwOrderSide, cwContracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: activeLeverage }).catch(()=>{});
                         
                         cw.subAccount.realizedPnl = (cw.subAccount.realizedPnl || 0) + cw.pnl;
@@ -553,9 +547,7 @@ const executeGlobalProfitMonitor = async () => {
                         globalUnrealized += pnl;
                         
                         const activeSide = cState.activeSide || botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side;
-                        
-                        const activeLeverage = getMaxLeverage(botData.exchange, symbol);
-                        await forceSetLeverage(botData.exchange, symbol, activeLeverage);
+                        const activeLeverage = global.maxLeverageCache.get(symbol) || await applyMaxLeverage(botData.exchange, symbol, profileId);
 
                         activeCandidates.push({
                             profileId, symbol, exchange: botData.exchange, unrealizedPnl: pnl,
@@ -719,7 +711,6 @@ const executeGlobalProfitMonitor = async () => {
 
                             try {
                                 const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                                await forceSetLeverage(pos.exchange, pos.symbol, pos.leverage);
                                 await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage }).catch(()=>{});
                                 pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
@@ -807,7 +798,6 @@ const executeGlobalProfitMonitor = async () => {
                                 const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
                                 if(bStateW) { bStateW.lockUntil = Date.now() + 10000; bStateW.contracts = 0; }
                                 const wOrderSide = biggestWinner.side === 'long' ? 'sell' : 'buy';
-                                await forceSetLeverage(biggestWinner.exchange, biggestWinner.symbol, biggestWinner.leverage);
                                 await biggestWinner.exchange.createOrder(biggestWinner.symbol, 'market', wOrderSide, biggestWinner.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: biggestWinner.leverage }).catch(()=>{});
                                 biggestWinner.subAccount.realizedPnl = (biggestWinner.subAccount.realizedPnl || 0) + biggestWinner.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": biggestWinner.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": biggestWinner.subAccount.realizedPnl } }).catch(()=>{});
@@ -857,7 +847,6 @@ const executeGlobalProfitMonitor = async () => {
                                     bData.state.coinStates[pos.symbol].unrealizedPnl = 0;
                                 }
                                 const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                                await forceSetLeverage(pos.exchange, pos.symbol, pos.leverage);
                                 await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true, lever_rate: pos.leverage });
                                 pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
