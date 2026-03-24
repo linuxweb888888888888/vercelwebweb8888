@@ -151,40 +151,51 @@ function calculateDcaQty(side, P0, Pc, C0, leverage, targetRoiPct) {
 }
 
 // ------------------------------------------------------------------------
-// AGGRESSIVE HTX MAX CROSS-LEVERAGE ENFORCER (Bypasses CCXT Bugs)
+// AGGRESSIVE HTX MAX CROSS-LEVERAGE ENFORCER (V4 - Smart Rate Limit Protection)
 // ------------------------------------------------------------------------
-async function forceSetLeverage(exchange, symbol, lev) {
+async function forceSetLeverage(exchange, symbol, lev, profileId) {
+    const market = exchange.market(symbol);
+    if (!market || !market.id) throw new Error('No market id');
+
     try {
-        // First, try standard CCXT which natively handles most HTX formatting
-        await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
-    } catch (e1) {
-        // If standard fails, aggressively fallback to direct HTX Cross Swap API
-        try {
-            const market = exchange.market(symbol);
-            if (market && market.id && typeof exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate === 'function') {
-                await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
-                    contract_code: market.id,
-                    lever_rate: lev
-                });
-            } else {
-                throw e1;
-            }
-        } catch (e2) {
-            // Fails silently if position blocks it, loop continues to next tier
-            throw new Error('Leverage rejected by exchange');
+        if (typeof exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate === 'function') {
+            await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
+                contract_code: market.id,
+                lever_rate: lev
+            });
+            return true;
+        } else {
+            await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
+            return true;
         }
+    } catch (e) {
+        const errMsg = e.message.toLowerCase();
+        
+        // If HTX gives the 1206 Risk Exposure error, throw a specific flag so the bot stops spamming
+        if (errMsg.includes('1206') || errMsg.includes('high risk exposure')) {
+            throw new Error('HTX_RISK_BLOCK_1206');
+        }
+        
+        // If HTX gives a 1032 Rate Limit error, throw a flag to pause
+        if (errMsg.includes('1032') || errMsg.includes('maximum number of access')) {
+            throw new Error('HTX_RATE_LIMIT_1032');
+        }
+
+        throw e;
     }
 }
 
 async function applyMaxLeverage(exchange, symbol, profileId) {
-    // If we already cached a high leverage, use it. 
-    // If it is stuck at 20 or lower, ignore the cache and try to push it higher again.
+    // Clear cache every 6 hours so we don't spam HTX if the user's limits haven't changed
+    if (!global.lastLeverageCacheClear || Date.now() - global.lastLeverageCacheClear > 21600000) {
+        global.maxLeverageCache.clear();
+        global.lastLeverageCacheClear = Date.now();
+    }
+
     if (global.maxLeverageCache.has(symbol)) {
         const cachedLev = global.maxLeverageCache.get(symbol);
-        if (cachedLev > 20) {
-            await forceSetLeverage(exchange, symbol, cachedLev).catch(()=>{});
-            return cachedLev;
-        }
+        await forceSetLeverage(exchange, symbol, cachedLev, profileId).catch(()=>{});
+        return cachedLev;
     }
 
     let foundMax = 10;
@@ -193,33 +204,40 @@ async function applyMaxLeverage(exchange, symbol, profileId) {
         const market = exchange.market(symbol);
         if (!market || !market.id) return 10;
 
-        // 1. Pull the absolute maximum leverage allowed for this coin directly from HTX API limits
         const exchangeMax = (market.limits && market.limits.leverage && market.limits.leverage.max) 
             ? Math.floor(market.limits.leverage.max) 
             : 75;
 
-        // 2. Create an intelligent array of tiers including HTX specific slider steps
-        const customTiers = [exchangeMax, 75, 60, 50, 45, 40, 30, 20, 15, 10];
-        
-        // Remove duplicates and filter out anything higher than the exchange allows, then sort descending
-        const tiersToTry = [...new Set(customTiers)]
+        // Smart Tiers: Skip 60/45/40 so we don't trigger the 1032 rate limit by making too many API calls
+        const tiersToTry = [exchangeMax, 50, 30, 20, 15, 10]
             .filter(lev => lev <= exchangeMax)
             .sort((a, b) => b - a);
 
         for (let lev of tiersToTry) {
             try {
-                await forceSetLeverage(exchange, symbol, lev);
-                // If the exchange accepted it without throwing an error, we found the ceiling!
+                await forceSetLeverage(exchange, symbol, lev, profileId);
                 foundMax = lev;
-                break; 
+                logForProfile(profileId, `⚡ Locked true CROSS maximum leverage for ${symbol} at ${foundMax}x`);
+                break; // Stop going down once accepted
+                
             } catch (e) {
-                // Exchange denied this tier (either too high or blocked by position size). Loops to next lower tier.
+                if (e.message === 'HTX_RISK_BLOCK_1206') {
+                    // HTX actively blocked high leverage. Immediately jump down to 20x to avoid rate limits.
+                    logForProfile(profileId, `⚠️ HTX Risk Blocked ${lev}x on ${symbol}. Jumping down to safe tiers.`);
+                    if (lev > 20) continue; // Will loop to try 20x next
+                } else if (e.message === 'HTX_RATE_LIMIT_1032') {
+                    // We hit a rate limit. Stop trying and just default to 20x to protect the API key.
+                    logForProfile(profileId, `🛑 HTX Rate Limit Hit. Defaulting ${symbol} to 20x.`);
+                    foundMax = 20;
+                    break;
+                }
+                // Other errors just let the loop continue to a lower tier
             }
         }
     } catch(e) {}
 
+    // Save whatever maximum we successfully found to memory so we don't spam HTX again
     global.maxLeverageCache.set(symbol, foundMax);
-    if (profileId) logForProfile(profileId, `⚡ [LEVERAGE DISCOVERY] Locked true CROSS maximum leverage for ${symbol} at ${foundMax}x`);
     return foundMax;
 }
 // ------------------------------------------------------------------------
@@ -343,6 +361,7 @@ async function startBot(userId, subAccount) {
                         cState.contracts = 0; cState.unrealizedPnl = 0; cState.currentRoi = 0;
 
                         const orderSide = activeSide === 'long' ? 'sell' : 'buy';
+                        // FIXED: Removed applyMaxLeverage here to prevent HTX blocking the close order
                         await exchange.createOrder(coin.symbol, 'market', orderSide, contractsToClose, undefined, { offset: 'close', reduceOnly: true }).catch(()=>{});
 
                         currentSettings.realizedPnl = (currentSettings.realizedPnl || 0) + unrealizedPnl;
@@ -509,7 +528,7 @@ const executeOneMinuteCloser = async () => {
                         cw.cState.contracts = 0; cw.cState.unrealizedPnl = 0; cw.cState.currentRoi = 0;
                         const cwOrderSide = cw.side === 'long' ? 'sell' : 'buy';
                         
-                        await applyMaxLeverage(cw.exchange, cw.symbol, cw.profileId);
+                        // FIXED: Removed applyMaxLeverage here to prevent HTX blocking the close order
                         cw.exchange.createOrder(cw.symbol, 'market', cwOrderSide, cwContracts, undefined, { offset: 'close', reduceOnly: true }).catch(()=>{});
                         
                         cw.subAccount.realizedPnl = (cw.subAccount.realizedPnl || 0) + cw.pnl;
@@ -577,11 +596,10 @@ const executeGlobalProfitMonitor = async () => {
                         globalUnrealized += pnl;
                         
                         const activeSide = cState.activeSide || botData.settings.coins.find(c => c.symbol === symbol)?.side || botData.settings.side;
-                        const activeLeverage = await applyMaxLeverage(botData.exchange, symbol, profileId);
-
+                        
                         activeCandidates.push({
                             profileId, symbol, exchange: botData.exchange, unrealizedPnl: pnl,
-                            contracts: cState.contracts, side: activeSide, leverage: activeLeverage, subAccount: botData.settings
+                            contracts: cState.contracts, side: activeSide, subAccount: botData.settings
                         });
                     }
                 }
@@ -674,8 +692,7 @@ const executeGlobalProfitMonitor = async () => {
                 }
                 else if (peakRowIndex === -1 || peakAccumulation < 0.0001) {
                     let allowNoPeakSl = false;
-                    // CHANGED: 30 minutes = 1,800,000 milliseconds
-                    if (Date.now() - lastNoPeakSlTime >= 1800000) allowNoPeakSl = true;
+                    if (Date.now() - lastNoPeakSlTime >= 1800000) allowNoPeakSl = true; // 30 mins
 
                     if (allowNoPeakSl) {
                         triggerOffset = true;
@@ -701,7 +718,8 @@ const executeGlobalProfitMonitor = async () => {
                             const bState = activeBots.get(pos.profileId).state.coinStates[pos.symbol];
                             const livePnl = bState ? (parseFloat(bState.unrealizedPnl) || 0) : pos.unrealizedPnl;
                             
-                            if (livePnl < pos.unrealizedPnl - 0.00001) continue; 
+                            // FIXED: Adjusted slippage tolerance from 0.00001 to 0.005 so it doesn't randomly abort
+                            if (livePnl < pos.unrealizedPnl - 0.005) continue; 
 
                             actualPairsToClose.push(pos);
                             liveCheckNet += livePnl;
@@ -741,7 +759,7 @@ const executeGlobalProfitMonitor = async () => {
 
                             try {
                                 const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                                await applyMaxLeverage(pos.exchange, pos.symbol, pos.profileId);
+                                // FIXED: Removed applyMaxLeverage here to prevent HTX blocking the close order
                                 await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true }).catch(()=>{});
                                 pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
@@ -811,7 +829,8 @@ const executeGlobalProfitMonitor = async () => {
                             const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
                             const liveW = bStateW ? (parseFloat(bStateW.unrealizedPnl)||0) : biggestWinner.unrealizedPnl;
                             
-                            if (liveW < biggestWinner.unrealizedPnl - 0.00001) {
+                            // FIXED: Adjusted slippage tolerance from 0.00001 to 0.005
+                            if (liveW < biggestWinner.unrealizedPnl - 0.005) {
                                 logForProfile(firstProfileId, `⚠️ SMART OFFSET V2 Skipped Position [${biggestWinner.symbol}]: Live PNL ($${liveW.toFixed(4)}) dropped below snapshotted.`);
                                 closeW = false;
                             }
@@ -829,7 +848,7 @@ const executeGlobalProfitMonitor = async () => {
                                 const bStateW = activeBots.get(biggestWinner.profileId).state.coinStates[biggestWinner.symbol];
                                 if(bStateW) { bStateW.lockUntil = Date.now() + 10000; bStateW.contracts = 0; }
                                 const wOrderSide = biggestWinner.side === 'long' ? 'sell' : 'buy';
-                                await applyMaxLeverage(biggestWinner.exchange, biggestWinner.symbol, biggestWinner.profileId);
+                                // FIXED: Removed applyMaxLeverage here to prevent HTX blocking the close order
                                 await biggestWinner.exchange.createOrder(biggestWinner.symbol, 'market', wOrderSide, biggestWinner.contracts, undefined, { offset: 'close', reduceOnly: true }).catch(()=>{});
                                 biggestWinner.subAccount.realizedPnl = (biggestWinner.subAccount.realizedPnl || 0) + biggestWinner.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": biggestWinner.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": biggestWinner.subAccount.realizedPnl } }).catch(()=>{});
@@ -879,7 +898,7 @@ const executeGlobalProfitMonitor = async () => {
                                     bData.state.coinStates[pos.symbol].unrealizedPnl = 0;
                                 }
                                 const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                                await applyMaxLeverage(pos.exchange, pos.symbol, pos.profileId);
+                                // FIXED: Removed applyMaxLeverage here to prevent HTX blocking the close order
                                 await pos.exchange.createOrder(pos.symbol, 'market', orderSide, pos.contracts, undefined, { offset: 'close', reduceOnly: true });
                                 pos.subAccount.realizedPnl = (pos.subAccount.realizedPnl || 0) + pos.unrealizedPnl;
                                 await Settings.updateOne({ "subAccounts._id": pos.subAccount._id }, { $set: { "subAccounts.$.realizedPnl": pos.subAccount.realizedPnl } }).catch(()=>{});
@@ -1054,21 +1073,18 @@ app.post('/api/settings', authMiddleware, async (req, res) => {
     res.json({ success: true, settings: updated });
 });
 
-// UPGRADED STATUS ROUTE: Automatically integrates Database State for seamless Reboots!
 app.get('/api/status', authMiddleware, async (req, res) => {
     bootstrapBots(); // Keep-alive trigger
     
     const settings = await Settings.findOne({ userId: req.userId });
     const userStatuses = {};
 
-    // Load Live Active memory
     for (let [profileId, botData] of activeBots.entries()) {
         if (botData.userId === req.userId.toString()) {
             userStatuses[profileId] = botData.state;
         }
     }
 
-    // Load DB Saved State (If memory is empty due to a sudden reboot, the DB fills it in instantly)
     if (settings && settings.subAccounts) {
         const subIds = settings.subAccounts.map(s => s._id.toString());
         const dbStates = await ProfileState.find({ profileId: { $in: subIds } });
