@@ -155,53 +155,65 @@ function calculateDcaQty(side, P0, Pc, C0, leverage, targetRoiPct) {
 // ------------------------------------------------------------------------
 async function forceSetLeverage(exchange, symbol, lev) {
     try {
-        const market = exchange.market(symbol);
-        if (market && market.id) {
-            if (typeof exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate === 'function') {
-                // Direct HTX API hit exclusively for CROSS margin
+        // First, try standard CCXT which natively handles most HTX formatting
+        await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
+    } catch (e1) {
+        // If standard fails, aggressively fallback to direct HTX Cross Swap API
+        try {
+            const market = exchange.market(symbol);
+            if (market && market.id && typeof exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate === 'function') {
                 await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
                     contract_code: market.id,
                     lever_rate: lev
                 });
             } else {
-                await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
+                throw e1;
             }
+        } catch (e2) {
+            // Fails silently if position blocks it, loop continues to next tier
+            throw new Error('Leverage rejected by exchange');
         }
-    } catch (e) {
-        // Silently catch if position blocks it, we only care that we tried
     }
 }
 
 async function applyMaxLeverage(exchange, symbol, profileId) {
+    // If we already cached a high leverage, use it. 
+    // If it is stuck at 20 or lower, ignore the cache and try to push it higher again.
     if (global.maxLeverageCache.has(symbol)) {
         const cachedLev = global.maxLeverageCache.get(symbol);
-        await forceSetLeverage(exchange, symbol, cachedLev);
-        return cachedLev;
+        if (cachedLev > 20) {
+            await forceSetLeverage(exchange, symbol, cachedLev).catch(()=>{});
+            return cachedLev;
+        }
     }
 
-    const tiersToTry = [200, 150, 125, 100, 75, 50, 20, 10];
     let foundMax = 10;
     
     try {
         const market = exchange.market(symbol);
         if (!market || !market.id) return 10;
 
+        // 1. Pull the absolute maximum leverage allowed for this coin directly from HTX API limits
+        const exchangeMax = (market.limits && market.limits.leverage && market.limits.leverage.max) 
+            ? Math.floor(market.limits.leverage.max) 
+            : 75;
+
+        // 2. Create an intelligent array of tiers including HTX specific slider steps
+        const customTiers = [exchangeMax, 75, 60, 50, 45, 40, 30, 20, 15, 10];
+        
+        // Remove duplicates and filter out anything higher than the exchange allows, then sort descending
+        const tiersToTry = [...new Set(customTiers)]
+            .filter(lev => lev <= exchangeMax)
+            .sort((a, b) => b - a);
+
         for (let lev of tiersToTry) {
             try {
-                if (typeof exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate === 'function') {
-                    // Direct HTX API hit exclusively for CROSS margin
-                    await exchange.contractPrivatePostLinearSwapApiV1SwapCrossSwitchLeverRate({
-                        contract_code: market.id,
-                        lever_rate: lev
-                    });
-                } else {
-                    await exchange.setLeverage(lev, symbol, { marginMode: 'cross' });
-                }
+                await forceSetLeverage(exchange, symbol, lev);
                 // If the exchange accepted it without throwing an error, we found the ceiling!
                 foundMax = lev;
                 break; 
             } catch (e) {
-                // Exchange denied this tier (too high). Loop will continue to next lower tier.
+                // Exchange denied this tier (either too high or blocked by position size). Loops to next lower tier.
             }
         }
     } catch(e) {}
