@@ -107,7 +107,7 @@ const OffsetRecordSchema = new mongoose.Schema({
 });
 const OffsetRecord = mongoose.models.OffsetRecord || mongoose.model('OffsetRecord', OffsetRecordSchema);
 
-// NEW: Persistent Live State Schema (Stores live PNL, DCA Timers, and Logs)
+// Persistent Live State Schema (Stores live PNL, DCA Timers, and Logs)
 const ProfileStateSchema = new mongoose.Schema({
     profileId: { type: mongoose.Schema.Types.ObjectId, required: true, unique: true },
     userId: { type: mongoose.Schema.Types.ObjectId, required: true },
@@ -584,13 +584,13 @@ const executeGlobalProfitMonitor = async () => {
                 }
                 else if (peakRowIndex === -1 || peakAccumulation < 0.0001) {
                     let allowNoPeakSl = false;
-                    // CHANGE: Check every 5 minutes (300,000 milliseconds)
-                    if (Date.now() - lastNoPeakSlTime >= 300000) allowNoPeakSl = true;
+                    // CHANGED: 30 minutes = 1,800,000 milliseconds
+                    if (Date.now() - lastNoPeakSlTime >= 1800000) allowNoPeakSl = true;
 
                     if (allowNoPeakSl) {
                         triggerOffset = true;
                         isNoPeakSl = true;
-                        reason = "NO PEAK (Closing Lowest PNL every 5 mins)";
+                        reason = "NO PEAK (Closing Lowest PNL every 30 mins)";
                         
                         const absoluteWorstCoin = activeCandidates[activeCandidates.length - 1];
                         finalNetProfit = absoluteWorstCoin.unrealizedPnl;
@@ -1859,8 +1859,7 @@ app.get('/', (req, res) => {
                             }
                         } else if (peakRowIndex === -1 || peakAccumulation < 0.0001) {
                             executingNoPeakSl = true;
-                            // CHANGED TO 5 MINS IN UI
-                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⚠️ No Peak Found (&le; $0.0000)! Ready to cut lowest PNL coin every 5 mins.</span>\`;
+                            topStatusMessage = \`<span style="color:#d93025; font-weight:bold;">⚠️ No Peak Found (&le; $0.0000)! Ready to cut lowest PNL coin every 30 mins.</span>\`;
                         } else {
                             let pColor = peakAccumulation >= 0.0001 ? '#1e8e3e' : '#5f6368';
                             topStatusMessage = \`TP Status: <span style="color:#1a73e8; font-weight:bold;">🔎 Seeking Peak &ge; $\${targetV1.toFixed(4)}</span> | Current Peak: <strong style="color:\${pColor}">+\$\${peakAccumulation.toFixed(4)}</strong>\`;
