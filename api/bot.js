@@ -46,38 +46,75 @@ let exchangeCache = {
     data: []
 };
 
-// ==================== MONGODB INIT ====================
+// ==================== MONGODB INIT (ROBUST "VACUUM" VERSION) ====================
 async function initDb() {
-    if (mongoClient) return; // Reuse connection if warm
+    // Check if fully initialized, not just the client
+    if (mongoClient && botDb && dbCollection && accounts.length > 0) return; 
     
-    mongoClient = new MongoClient(MONGO_URI);
-    await mongoClient.connect();
-    botDb = mongoClient.db("botdb");
-    dbCollection = mongoClient.db("HTX_Aggregator").collection("session_growth");
-    
-    const usersCol = botDb.collection("users");
-    const masterUser = await usersCol.findOne({ username: TARGET_USERNAME });
-    
-    if (masterUser) {
+    try {
+        mongoClient = new MongoClient(MONGO_URI);
+        await mongoClient.connect();
+        
+        botDb = mongoClient.db("botdb");
+        dbCollection = mongoClient.db("HTX_Aggregator").collection("session_growth");
+        
+        const usersCol = botDb.collection("users");
+        
+        // 1. Find the Master User
+        const masterUser = await usersCol.findOne({ username: TARGET_USERNAME });
+        
+        if (!masterUser) {
+            throw new Error(`User '${TARGET_USERNAME}' does not exist in the 'users' collection.`);
+        }
+        
         targetUserId = masterUser._id;
         targetIsPaper = masterUser.isPaper || false;
         
         const settingsColName = targetIsPaper ? "paper_settings" : "settings";
         const settingsCol = botDb.collection(settingsColName);
-        activeBotSettings = await settingsCol.findOne({ userId: targetUserId }) || {};
         
-        if (activeBotSettings.subAccounts) {
-            accounts = activeBotSettings.subAccounts
-                .filter(sub => sub.apiKey && sub.secret)
-                .map((sub, index) => ({
-                    id: index + 1,
-                    name: sub.name || `Profile ${index + 1}`,
-                    apiKey: sub.apiKey,
-                    secret: sub.secret,
-                    lastPositions: {},
-                    hasFetchedPositionsOnce: false
-                }));
+        // 2. Find Settings (Check both ObjectId and String formats for userId)
+        activeBotSettings = await settingsCol.findOne({ 
+            $or: [
+                { userId: targetUserId }, 
+                { userId: targetUserId.toString() }
+            ] 
+        }) || {};
+        
+        // 3. Hunt for the API profiles (Check all common database naming conventions)
+        let rawProfiles = activeBotSettings.subAccounts 
+                       || activeBotSettings.accounts 
+                       || masterUser.subAccounts 
+                       || masterUser.accounts 
+                       || [];
+        
+        if (!rawProfiles || rawProfiles.length === 0) {
+            throw new Error(`No API profiles found in DB for '${TARGET_USERNAME}'. Checked settings & user doc.`);
         }
+
+        // 4. Map the profiles into memory
+        accounts = rawProfiles
+            .filter(sub => sub.apiKey && sub.secret)
+            .map((sub, index) => ({
+                id: index + 1,
+                name: sub.name || `Profile ${index + 1}`,
+                apiKey: sub.apiKey,
+                secret: sub.secret,
+                lastPositions: {},
+                hasFetchedPositionsOnce: false
+            }));
+
+        if (accounts.length === 0) {
+            throw new Error("Profiles were found, but they are missing 'apiKey' or 'secret' fields.");
+        }
+
+    } catch (err) {
+        // If connection/setup fails, wipe the cache so we can try again cleanly
+        mongoClient = null;
+        botDb = null;
+        dbCollection = null;
+        accounts = [];
+        throw new Error("Database Init Error: " + err.message);
     }
 }
 
@@ -146,7 +183,7 @@ async function fetchAccountData(currency) {
     return results;
 }
 
-// ==================== API ROUTES (REPLACES SOCKET.IO) ====================
+// ==================== API ROUTES ====================
 
 app.get('/', (req, res) => res.send(getHtml()));
 
@@ -237,6 +274,7 @@ app.get('/api/data', async (req, res) => {
             }
         });
     } catch (e) {
+        // Return a clean 500 error to the frontend if something breaks
         res.status(500).json({ error: e.message });
     }
 });
@@ -263,7 +301,7 @@ app.post('/api/reset', async (req, res) => {
 // Export Express App for Vercel
 module.exports = app;
 
-// ==================== UI TEMPLATE (Refactored for Fetch Polling) ====================
+// ==================== UI TEMPLATE ====================
 function getHtml() { 
     return `
 <!DOCTYPE html>
@@ -277,9 +315,6 @@ function getHtml() {
     <style>
         :root { --primary: #3f51b5; --bg: #f0f2f5; --card-bg: #ffffff; --text-main: #1f2937; --text-light: #6b7280; --green: #10b981; --red: #ef4444; --shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
         body { background: var(--bg); color: var(--text-main); font-family: 'Roboto', sans-serif; margin: 0; padding: 0; }
-        
-        /* NOTE: PASTE YOUR EXTRA CUSTOM CSS HERE IF NEEDED */
-        
         .top-nav { background: #ffffff; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); height: 60px; margin-bottom: 25px; }
         .nav-logo { font-size: 18px; font-weight: 700; color: var(--primary); }
         .nav-links { display: flex; gap: 20px; }
@@ -341,7 +376,7 @@ function getHtml() {
     <div class="header">
         <div>
             <h1 id="page-title">Portfolio Overview</h1>
-            <div class="subtitle" id="status-text">Connecting to Vercel API...</div>
+            <div class="subtitle" id="status-text" style="color:var(--primary); font-weight:600;">Connecting to Vercel API...</div>
         </div>
         <div class="controls">
             <select class="currency-select" id="currencySelect" onchange="changeCurrency(this.value)">
@@ -502,6 +537,15 @@ function getHtml() {
             // If the server returns a crash (500) or not found (404), throw an error so the catch block sees it
             if (!res.ok) {
                 const textError = await res.text();
+                // Check if it's JSON to print cleaner error
+                try {
+                    const jsonError = JSON.parse(textError);
+                    if(jsonError.error) throw new Error(jsonError.error);
+                } catch(e) {
+                    if(e.message !== "Unexpected token < in JSON at position 0") {
+                        throw new Error(e.message);
+                    }
+                }
                 throw new Error(\`Server returned \${res.status}: \${textError}\`);
             }
 
@@ -523,7 +567,9 @@ function getHtml() {
                 return;
             }
 
-            document.getElementById('status-text').innerText = \`Tracking \${c.currency} Portfolio\`;
+            document.getElementById('status-text').innerText = \`Tracking \${c.currency} Portfolio (\${c.loadedCount} accounts)\`;
+            document.getElementById('status-text').style.color = 'var(--text-light)';
+            
             document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
             document.getElementById('time').innerText = c.timestamp;
 
@@ -555,6 +601,7 @@ function getHtml() {
             console.error("Fetch Data Error:", err);
             // This will display exactly what broke right below the "Portfolio Overview" title
             document.getElementById('status-text').innerText = 'Connection Error: ' + err.message;
+            document.getElementById('status-text').style.color = 'var(--red)';
         }
     }
 
