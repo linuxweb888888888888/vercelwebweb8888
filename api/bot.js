@@ -13,7 +13,7 @@ app.use(express.json());
 // ==================== CONFIGURATION ====================
 // 🚨 Replace 'YOUR_PASSWORD_HERE' with your real DB password. 
 // Best practice: Store this in Vercel Project Settings -> Environment Variables as MONGO_URI
-const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:YOUR_PASSWORD_HERE@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
 const TARGET_USERNAME = 'webwebwebweb8888';
 const SUPPORTED_CURRENCIES = ['USDT', 'SHIB', 'XRP', 'BCH', 'ZAR'];
