@@ -14,7 +14,7 @@ app.use(express.json());
 
 // ==================== CONFIGURATION ====================
 // Set your MONGO_URI in Vercel Environment Variables!
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:YOUR_PASSWORD@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 const TARGET_USERNAME = 'webwebwebweb8888';
 const CACHE_TTL_MS = 2000; // Cache exchange data for 2 seconds to prevent Vercel rate-limit bans
 
