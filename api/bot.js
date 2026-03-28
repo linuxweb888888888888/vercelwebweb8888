@@ -7,6 +7,8 @@ const express = require('express');
 const ccxt = require('ccxt');
 const { MongoClient } = require('mongodb');
 
+// dotenv removed for Vercel compatibility
+
 const app = express();
 app.use(express.json());
 
@@ -276,7 +278,8 @@ function getHtml() {
         :root { --primary: #3f51b5; --bg: #f0f2f5; --card-bg: #ffffff; --text-main: #1f2937; --text-light: #6b7280; --green: #10b981; --red: #ef4444; --shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
         body { background: var(--bg); color: var(--text-main); font-family: 'Roboto', sans-serif; margin: 0; padding: 0; }
         
-        /* ... (KEEP ALL YOUR EXACT CSS STYLES HERE. REMOVED FOR BREVITY IN CODE BLOCK, PASTE YOUR CSS) ... */
+        /* NOTE: PASTE YOUR EXTRA CUSTOM CSS HERE IF NEEDED */
+        
         .top-nav { background: #ffffff; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); height: 60px; margin-bottom: 25px; }
         .nav-logo { font-size: 18px; font-weight: 700; color: var(--primary); }
         .nav-links { display: flex; gap: 20px; }
@@ -495,8 +498,19 @@ function getHtml() {
     async function fetchData() {
         try {
             const res = await fetch('/api/data?currency=' + activeCurrency);
+            
+            // If the server returns a crash (500) or not found (404), throw an error so the catch block sees it
+            if (!res.ok) {
+                const textError = await res.text();
+                throw new Error(\`Server returned \${res.status}: \${textError}\`);
+            }
+
             const data = await res.json();
             
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
             document.getElementById('dot').classList.add('live');
             setTimeout(() => document.getElementById('dot').classList.remove('live'), 500);
 
@@ -538,7 +552,9 @@ function getHtml() {
             updatePreciseReasoning(data.dbRecords, data.botSettings, c.startTime, c.growth, data.marketEvents);
 
         } catch(err) {
-            document.getElementById('status-text').innerText = 'Connection lost...';
+            console.error("Fetch Data Error:", err);
+            // This will display exactly what broke right below the "Portfolio Overview" title
+            document.getElementById('status-text').innerText = 'Connection Error: ' + err.message;
         }
     }
 
