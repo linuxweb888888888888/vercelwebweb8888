@@ -2,41 +2,42 @@ const express = require('express');
 const axios = require('axios');
 
 const app = express();
-const PORT = 3000;
 
 // Your NewsAPI Key
 const API_KEY = '5b69e4d348ad436ca832910872c7d663';
 
-// Main Route (Handles both Home Page and Search)
+// Main Route
 app.get('/', async (req, res) => {
     const searchQuery = req.query.q || '';
     let apiUrl = '';
     let pageTitle = '';
 
     if (searchQuery) {
-        // Search all news for the query
         apiUrl = `https://newsapi.org/v2/everything?q=${encodeURIComponent(searchQuery)}&pageSize=10&apiKey=${API_KEY}`;
         pageTitle = `Search Results for "${searchQuery}"`;
     } else {
-        // Default: Top 10 Headlines in the US
         apiUrl = `https://newsapi.org/v2/top-headlines?country=us&pageSize=10&apiKey=${API_KEY}`;
         pageTitle = 'Top 10 Headlines';
     }
 
     try {
         const response = await axios.get(apiUrl);
-        // Filter out articles removed by publishers
         const articles = response.data.articles.filter(article => article.title !== '[Removed]');
         
-        // Render the HTML page directly
         res.send(generateHTML(articles, pageTitle, searchQuery));
     } catch (error) {
         console.error("Error fetching news:", error.message);
-        res.send(generateHTML([], 'Error fetching news. Please try again later.', searchQuery));
+        
+        // Detailed error message if NewsAPI blocks the Vercel deployment
+        const errorMsg = error.response && error.response.status === 426 
+            ? "NewsAPI blocks free keys on production servers like Vercel. You must upgrade to a paid NewsAPI plan or run this on localhost." 
+            : "Error fetching news. Please try again later.";
+
+        res.send(generateHTML([], errorMsg, searchQuery));
     }
 });
 
-// Function to generate the HTML String
+// HTML Generator Function
 function generateHTML(articles, title, searchQuery) {
     let articlesHTML = '';
 
@@ -58,7 +59,7 @@ function generateHTML(articles, title, searchQuery) {
             </div>
         `).join('');
     } else {
-        articlesHTML = `<div class="col-12"><div class="alert alert-warning">No articles found. Try searching for something else!</div></div>`;
+        articlesHTML = `<div class="col-12"><div class="alert alert-warning">${title === 'Top 10 Headlines' ? 'No articles found.' : title}</div></div>`;
     }
 
     return `
@@ -68,11 +69,9 @@ function generateHTML(articles, title, searchQuery) {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>News Blog</title>
-        <!-- Bootstrap CSS -->
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     </head>
     <body class="bg-light">
-        <!-- Navigation & Search Bar -->
         <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
             <div class="container">
                 <a class="navbar-brand" href="/">📰 Daily News Blog</a>
@@ -82,8 +81,6 @@ function generateHTML(articles, title, searchQuery) {
                 </form>
             </div>
         </nav>
-
-        <!-- Main Content -->
         <div class="container">
             <h2 class="mb-4">${title}</h2>
             <div class="row">
@@ -95,7 +92,5 @@ function generateHTML(articles, title, searchQuery) {
     `;
 }
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-});
+// EXPORT THE APP FOR VERCEL INSTEAD OF APP.LISTEN()
+module.exports = app;
