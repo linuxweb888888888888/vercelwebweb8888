@@ -6,9 +6,13 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-// 🚨 SECURITY NOTE: In Vercel, put your Mongo string in Settings -> Environment Variables as MONGO_URI
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
+// 🚨 SECURITY NOTE: Use Vercel Environment Variables.
+const MONGO_URI = process.env.MONGO_URI; 
 const TARGET_USERNAME = 'webweb8888';
+
+if (!MONGO_URI) {
+    console.warn("⚠️ MONGO_URI environment variable is missing!");
+}
 
 // ==================== GLOBALS ====================
 let mongoClient = null;
@@ -56,15 +60,17 @@ async function ensureDbLoaded() {
             return { success: false, error: "Settings or subAccounts missing for user." };
         }
 
+        const ExchangeClass = ccxt.htx || ccxt.huobi; 
+
         accounts = masterSettings.subAccounts
             .filter(sub => sub.apiKey && sub.secret)
             .map((sub, index) => ({
                 id: index + 1,
                 name: sub.name || `Profile ${index + 1}`,
-                exchange: new ccxt.huobi({
+                exchange: new ExchangeClass({
                     apiKey: sub.apiKey,
                     secret: sub.secret,
-                    enableRateLimit: false,
+                    enableRateLimit: true, 
                     options: { defaultType: 'linear' }
                 }),
                 data: { total: 0, free: 0, used: 0, error: null }
@@ -88,7 +94,6 @@ async function fetchAccountData(acc, currency) {
     let needsPositionFetch = true;
 
     try {
-        // STEP 1: Try the standard CCXT fetchBalance (works for normal non-unified accounts)
         try {
             const bal = await acc.exchange.fetchBalance({ type: 'swap', marginMode: 'cross' });
             if (bal?.total?.[currency] !== undefined) {
@@ -97,23 +102,20 @@ async function fetchAccountData(acc, currency) {
                 balSuccess = true;
             }
         } catch(e) {
-            // STEP 2: If HTX rejects it because the account is Unified (Error 4002)
             if (e.message.includes('v3/unified_account_info') || e.message.includes('4002')) {
                 try {
-                    // Use CCXT's implicit method to call the exact endpoint HTX is asking for
                     const unifiedRes = await acc.exchange.contractPrivateGetLinearSwapApiV3UnifiedAccountInfo();
                     
                     if (unifiedRes && unifiedRes.data) {
-                        // Find the requested currency in the unified data array
                         const assetData = unifiedRes.data.find(d => d.margin_asset.toUpperCase() === currency.toUpperCase());
                         
                         if (assetData) {
-                            totalEquity = parseFloat(assetData.margin_balance || 0); // Wallet + PnL
-                            freeCurrency = parseFloat(assetData.free || 0);          // Available to trade
-                            staticWalletBalance = parseFloat(assetData.margin_static || 0); // Wallet Balance without PnL
+                            totalEquity = parseFloat(assetData.margin_balance || 0); 
+                            freeCurrency = parseFloat(assetData.free || 0);          
+                            staticWalletBalance = parseFloat(assetData.margin_static || 0); 
                             
                             balSuccess = true;
-                            needsPositionFetch = false; // V3 API gives us static margin natively! No need to fetch positions.
+                            needsPositionFetch = false; 
                         } else {
                             throw new Error(`Asset ${currency} not found in Unified Account.`);
                         }
@@ -124,14 +126,12 @@ async function fetchAccountData(acc, currency) {
                     throw new Error(`Unified API Error: ${v3Err.message}`);
                 }
             } else {
-                // If it's a different error (like invalid API keys), throw it normally
                 throw e; 
             }
         }
         
         if (!balSuccess) throw new Error(`Balance Fetch Failed - ${currency} missing.`);
 
-        // STEP 3: If we used the old API, we must manually calculate unrealized PnL to find the static wallet balance
         if (needsPositionFetch) {
             let totalUnrealizedPnl = 0;
             try {
@@ -143,7 +143,6 @@ async function fetchAccountData(acc, currency) {
             staticWalletBalance = totalEquity - totalUnrealizedPnl;
         }
 
-        // STEP 4: Store Data
         acc.data = {
             total: isNaN(staticWalletBalance) ? 0 : staticWalletBalance,
             free: isNaN(freeCurrency) ? 0 : freeCurrency,
@@ -152,13 +151,14 @@ async function fetchAccountData(acc, currency) {
         };
 
     } catch (err) {
-        // FULL ERROR EXPOSURE
         acc.data.error = err.message || err.toString();
     }
 }
 
 // ==================== 3. VERCEL API ENDPOINTS ====================
 app.get('/api/data', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
     const requestedCurrency = req.query.currency || 'USDT';
     
     if (requestedCurrency !== state.currency) {
@@ -172,10 +172,7 @@ app.get('/api/data', async (req, res) => {
             return res.json({ error: dbStatus.error, combined: { isReady: false } });
         }
 
-        for (let i = 0; i < accounts.length; i++) {
-            await fetchAccountData(accounts[i], state.currency);
-            await new Promise(resolve => setTimeout(resolve, 500)); 
-        }
+        await Promise.all(accounts.map(acc => fetchAccountData(acc, state.currency)));
 
         let grandTotal = 0, grandFree = 0, grandUsed = 0, loadedCount = 0;
         accounts.forEach(acc => {
@@ -252,6 +249,7 @@ app.get('/api/data', async (req, res) => {
 });
 
 app.post('/api/reset', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     await ensureDbLoaded(); 
     let grandTotal = accounts.reduce((sum, a) => sum + (a.data.total || 0), 0);
     state.startTime = Date.now();
@@ -268,7 +266,10 @@ app.post('/api/reset', async (req, res) => {
     res.json({ success: true });
 });
 
-app.get('/', (req, res) => res.send(getHtml()));
+app.get('/', (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(getHtml())
+});
 
 // ==================== HTML / FRONTEND ====================
 function getHtml() {
@@ -281,7 +282,6 @@ function getHtml() {
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
     <style>
-        /* Exact Google AdSense Material Design CSS */
         :root {
             --google-blue: #1a73e8;
             --text-main: #202124;
@@ -506,17 +506,6 @@ function getHtml() {
     <script>
         let currentCurrency = 'USDT';
 
-        // Simulation State for Ad Math
-        let simState = { 
-            initialized: false, 
-            dayRatios: [], 
-            targetRpm: 0, 
-            impressionRatio: 0, 
-            targetCpc: 0,
-            fillRate: 0,
-            currentCurrency: '' 
-        };
-
         function switchTab(tabName) {
             document.getElementById('page-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
             document.getElementById('page-accounts').style.display = tabName === 'accounts' ? 'block' : 'none';
@@ -537,7 +526,6 @@ function getHtml() {
             document.getElementById('total').innerText = '...';
         }
         
-        // Exact AdSense format: US Dollars ($) with 2 decimal points
         const fmt = (n) => {
             const num = Number(n);
             const sign = num < 0 ? '-' : '';
@@ -565,28 +553,10 @@ function getHtml() {
             if(colorize) el.className = 'value ' + colorClass(val);
         };
 
-        function initSimulation(currency) {
-            simState.initialized = true;
-            simState.currentCurrency = currency;
-            simState.dayRatios = [];
-            // Generate random values between 0 and 1 for 30 days history
-            for(let i = 0; i < 30; i++) {
-                simState.dayRatios.push(Math.random()); 
-            }
-            // Establish base RPM ($2.50 to $8.00 range)
-            simState.targetRpm = 2.5 + (Math.random() * 5.5); 
-            // Establish Impressions ratio (1.1x to 2.5x of page views)
-            simState.impressionRatio = 1.1 + (Math.random() * 1.4); 
-            // Establish target CPC ($0.15 to $1.00)
-            simState.targetCpc = 0.15 + (Math.random() * 0.85);
-            // Establish Ad Request Fill Rate (75% to 95%)
-            simState.fillRate = 0.75 + (Math.random() * 0.20);
-        }
-
         async function pollData() {
             try {
                 document.getElementById('dot').classList.remove('live');
-                const res = await fetch('/api/data?currency=' + currentCurrency);
+                const res = await fetch('/api/data?currency=' + currentCurrency + '&_=' + new Date().getTime());
                 const data = await res.json();
                 
                 if (data.error) {
@@ -605,59 +575,41 @@ function getHtml() {
                         document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
                         document.getElementById('time').innerText = "Synced: " + c.timestamp;
 
-                        // Balance mappings (Now entirely formatted as US Dollars)
+                        // Balance mappings
                         updateVal('total', c.total, false, false);
                         
-                        // ===== CUSTOM AD MATH =====
-                        if (!simState.initialized || simState.currentCurrency !== c.currency) {
-                            initSimulation(c.currency);
-                        }
-
-                        // Protect against negative growth for display illusion
+                        // ===== DETERMINISTIC MATH (Everything is calculated strictly from Today's Revenue) =====
                         let todaySoFar = Math.max(0, c.growth); 
 
-                        // 1. Yesterday (Random fraction of today)
-                        let yesterday = todaySoFar * simState.dayRatios[0];
+                        // 1. Fixed Historical Ratios based on today's revenue
+                        let yesterday = todaySoFar * 0.92;      // Fixed 92% of today
+                        let last7Days = todaySoFar * 6.5;       // Fixed 6.5x today
+                        let thisMonth = todaySoFar * 22.4;      // Fixed 22.4x today
+                        let lastPayment = todaySoFar * 20.1;    // Fixed 20.1x today
 
-                        // 2. Last 7 Days (Today + 6 random days)
-                        let last7Days = todaySoFar;
-                        for(let i=0; i<6; i++) last7Days += (todaySoFar * simState.dayRatios[i]);
+                        // 2. Fixed Traffic Settings
+                        let targetRpm = 4.25;  // Fixed RPM is $4.25
+                        let targetCpc = 0.45;  // Fixed CPC is $0.45
 
-                        // 3. This Month (Today + 29 random days)
-                        let thisMonth = todaySoFar;
-                        for(let i=0; i<29; i++) thisMonth += (todaySoFar * simState.dayRatios[i]);
+                        // 3. Deterministic Traffic Metrics
+                        let pageViews = todaySoFar > 0 ? Math.floor((todaySoFar / targetRpm) * 1000) : 0;
+                        let impressions = Math.floor(pageViews * 1.4);       // Fixed 1.4 ads per page
+                        let adRequests = Math.floor(impressions * 1.15);     // Fixed 85% fill rate equivalent
+                        let clicks = todaySoFar > 0 ? Math.floor(todaySoFar / targetCpc) : 0;
 
-                        // 4. Last Payment (Matches This Month)
-                        let lastPayment = thisMonth;
-
-                        // 5. Page Views (Reverse calculated from today's earnings and target RPM)
-                        let pageViews = todaySoFar > 0 ? Math.floor((todaySoFar / simState.targetRpm) * 1000) : 0;
-                        
-                        // 6. Impressions (Scaled up from Page Views)
-                        let impressions = Math.floor(pageViews * simState.impressionRatio);
-
-                        // 7. Exact Display RPM
+                        // 4. Exact display Rates (Derived backward from rounded values to ensure math is visually perfect)
                         let rpm = pageViews > 0 ? (todaySoFar / pageViews) * 1000 : 0.00;
-
-                        // 8. Ad Requests (Scaled up from Impressions based on Fill Rate)
-                        let adRequests = Math.floor(impressions / simState.fillRate);
-
-                        // 9. Clicks and CPC
-                        let clicks = todaySoFar > 0 ? Math.ceil(todaySoFar / simState.targetCpc) : 0;
                         let cpc = clicks > 0 ? (todaySoFar / clicks) : 0.00;
-
-                        // 10. Page CTR
                         let ctr = pageViews > 0 ? (clicks / pageViews) * 100 : 0.00;
 
                         // UPDATE UI
-                        updateVal('free', last7Days, false, false); // Pending mapped to Last 7 days
+                        updateVal('free', last7Days, false, false); 
                         updateVal('adToday', todaySoFar, false, true);
                         updateVal('adYesterday', yesterday, false, false);
                         updateVal('adLast7', last7Days, false, false);
                         updateVal('adMonth', thisMonth, false, false);
                         updateVal('adLastPayment', lastPayment, false, false);
 
-                        // Update Trend percentage for "Today" so it looks active
                         const pctEl = document.getElementById('growthPct');
                         pctEl.innerText = fmtPct(c.growthPct);
                         pctEl.className = 'trend ' + colorClass(c.growthPct);
@@ -668,8 +620,6 @@ function getHtml() {
                         document.getElementById('adRequests').innerText = adRequests.toLocaleString('en-US');
                         
                         updateVal('adRpm', rpm, false, false);
-                        
-                        // Set exact CPC and CTR formatted strings
                         document.getElementById('adCpc').innerText = fmt(cpc);
                         document.getElementById('adCtr').innerText = Number(ctr).toFixed(2) + '%';
 
