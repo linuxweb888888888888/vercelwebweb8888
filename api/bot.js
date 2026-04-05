@@ -7,7 +7,7 @@ app.use(express.json());
 
 // ==================== CONFIGURATION ====================
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-const TARGET_USERNAME = 'webwebwebweb8888'; // Try changing this to 'webweb8888' if it fails
+const TARGET_USERNAME = 'webweb8888'; // Try changing this to 'webweb8888' if it fails
 const SUPPORTED_CURRENCIES = ['USDT', 'SHIB', 'XRP', 'BCH', 'ZAR'];
 
 let mongoClient = null;
