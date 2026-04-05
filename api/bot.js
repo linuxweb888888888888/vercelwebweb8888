@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 const TARGET_USERNAME = 'webweb8888';
 
 // ==================== GLOBALS ====================
@@ -25,7 +25,7 @@ let state = {
 
 // ==================== 1. DATABASE LOADER ====================
 async function ensureDbLoaded() {
-    if (accounts.length > 0) return true;
+    if (accounts.length > 0) return { success: true };
 
     try {
         if (!mongoClient) {
@@ -37,7 +37,10 @@ async function ensureDbLoaded() {
 
         const usersCol = botDb.collection("users");
         const masterUser = await usersCol.findOne({ username: TARGET_USERNAME });
-        if (!masterUser) return false;
+        
+        if (!masterUser) {
+            return { success: false, error: `User ${TARGET_USERNAME} not found in DB.` };
+        }
 
         targetUserId = masterUser._id;
         const settingsColName = masterUser.isPaper ? "paper_settings" : "settings";
@@ -48,7 +51,9 @@ async function ensureDbLoaded() {
             masterSettings = await settingsCol.findOne({ userId: targetUserId.toString() }); 
         }
         
-        if (!masterSettings || !masterSettings.subAccounts) return false;
+        if (!masterSettings || !masterSettings.subAccounts) {
+            return { success: false, error: "Settings or subAccounts missing for user." };
+        }
 
         accounts = masterSettings.subAccounts
             .filter(sub => sub.apiKey && sub.secret)
@@ -64,9 +69,12 @@ async function ensureDbLoaded() {
                 data: { total: 0, free: 0, used: 0, error: null }
             }));
 
-        return accounts.length > 0;
+        if (accounts.length === 0) return { success: false, error: "No accounts with API keys found." };
+        
+        return { success: true };
     } catch (err) {
-        return false;
+        console.error("DB Load Error:", err);
+        return { success: false, error: `MongoDB Connection Error: ${err.message}` };
     }
 }
 
@@ -84,7 +92,7 @@ async function fetchAccountData(acc, currency) {
             }
         } catch(e) { throw e; }
         
-        if (!balSuccess) throw new Error("Balance Fetch Failed");
+        if (!balSuccess) throw new Error(`Balance Fetch Failed - ${currency} missing from response.`);
 
         let totalUnrealizedPnl = 0;
         try {
@@ -92,7 +100,9 @@ async function fetchAccountData(acc, currency) {
             if (ccxtPos) {
                 ccxtPos.forEach(p => { totalUnrealizedPnl += parseFloat(p.unrealizedPnl || 0); });
             }
-        } catch(e) {}
+        } catch(e) {
+            // Non-fatal, keep going but log internally
+        }
 
         const staticWalletBalance = totalEquity - totalUnrealizedPnl;
 
@@ -103,10 +113,8 @@ async function fetchAccountData(acc, currency) {
             error: null
         };
     } catch (err) {
-        let errMsg = err.message || "API Error";
-        errMsg = errMsg.replace('huobi ', ''); 
-        if(errMsg.length > 40) errMsg = errMsg.substring(0, 40) + "...";
-        acc.data.error = errMsg;
+        // FULL ERROR DISPLAY - Removed the 40 character truncation
+        acc.data.error = err.message || err.toString();
     }
 }
 
@@ -120,15 +128,14 @@ app.get('/api/data', async (req, res) => {
     }
 
     try {
-        const hasAccounts = await ensureDbLoaded();
-        if (!hasAccounts) return res.json({ error: "DB Load Error", combined: { isReady: false } });
+        const dbStatus = await ensureDbLoaded();
+        if (!dbStatus.success) {
+            return res.json({ error: dbStatus.error, combined: { isReady: false } });
+        }
 
-        // 🚨 THE FIX FOR P2 (4002 ERROR): 
-        // Instead of Promise.all (which causes timestamp collisions), 
-        // we loop through them one by one with a 500ms delay, exactly like your Socket code.
         for (let i = 0; i < accounts.length; i++) {
             await fetchAccountData(accounts[i], state.currency);
-            await new Promise(resolve => setTimeout(resolve, 500)); // 500ms Stagger
+            await new Promise(resolve => setTimeout(resolve, 500)); 
         }
 
         let grandTotal = 0, grandFree = 0, grandUsed = 0, loadedCount = 0;
@@ -197,11 +204,17 @@ app.get('/api/data', async (req, res) => {
         res.json(payload);
 
     } catch (err) {
-        res.status(500).json({ error: "Server error", combined: { isReady: false } });
+        // FULL SERVER ERROR EXPOSURE
+        res.status(500).json({ 
+            error: `Server Crash: ${err.message}`, 
+            stack: err.stack,
+            combined: { isReady: false } 
+        });
     }
 });
 
 app.post('/api/reset', async (req, res) => {
+    await ensureDbLoaded(); 
     let grandTotal = accounts.reduce((sum, a) => sum + (a.data.total || 0), 0);
     state.startTime = Date.now();
     state.startBalance = grandTotal;
@@ -259,6 +272,7 @@ function getHtml() {
         th { background: #f9fafb; padding: 16px; text-align: left; border-bottom: 1px solid #e5e7eb; font-size: 12px; text-transform: uppercase; }
         td { padding: 16px; border-bottom: 1px solid #f3f4f6; }
         td.num-col { font-family: 'Roboto Mono'; font-size: 13px; text-align: right;}
+        td.status-col { max-width: 300px; word-wrap: break-word; white-space: normal; text-align: right; } /* Added text wrapping for long errors */
         .footer { text-align: center; margin-top: 40px; padding-bottom:20px; color: var(--text-light); font-size: 12px; }
         .dot { height: 8px; width: 8px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 6px; }
         .dot.live { background-color: var(--green); box-shadow: 0 0 4px var(--green); }
@@ -278,7 +292,7 @@ function getHtml() {
     <div class="header">
         <div>
             <h1 id="page-title">Portfolio Overview</h1>
-            <div class="subtitle" id="status-text">Connecting to Vercel API...</div>
+            <div class="subtitle" id="status-text" style="color:var(--red); font-weight:bold;">Connecting to Vercel API...</div>
         </div>
         <div class="controls">
             <select class="currency-select" id="currencySelect" onchange="changeCurrency(this.value)">
@@ -292,7 +306,6 @@ function getHtml() {
         </div>
     </div>
 
-    <!-- PAGE 1: DASHBOARD -->
     <div id="page-dashboard">
         <div class="grid">
             <div class="card">
@@ -323,7 +336,6 @@ function getHtml() {
         </div>
     </div>
 
-    <!-- PAGE 2: ACCOUNTS -->
     <div id="page-accounts" style="display: none;">
         <div class="table-card">
             <table id="accTable">
@@ -359,15 +371,14 @@ function getHtml() {
     async function resetSession() { 
         if(confirm('Reset stats to current Wallet Balance?')) {
             await fetch('/api/reset', { method: 'POST' });
-            pollData();
         }
     }
     
     function changeCurrency(newCoin) {
         currentCurrency = newCoin;
         document.getElementById('status-text').innerText = 'Switching currencies...';
+        document.getElementById('status-text').style.color = 'var(--text-light)';
         document.getElementById('total').innerText = 'Loading...';
-        pollData();
     }
     
     const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 6, maximumFractionDigits: 10 });
@@ -399,41 +410,45 @@ function getHtml() {
             const data = await res.json();
             
             if (data.error) {
-                document.getElementById('status-text').innerText = data.error;
-                return;
+                // EXPOSE API/DATABASE ERRORS ON SCREEN
+                document.getElementById('status-text').innerText = "ERROR: " + data.error;
+                document.getElementById('status-text').style.color = "var(--red)";
+            } else {
+                document.getElementById('dot').classList.add('live');
+                const c = data.combined;
+                
+                if (!c.isReady) {
+                    document.getElementById('status-text').innerText = \`Fetching \${c.currency} Data via Vercel... (\${c.loadedCount}/\${c.totalCount})\`;
+                    document.getElementById('status-text').style.color = "var(--text-light)";
+                    renderTable(data.accounts, c.currency);
+                } else {
+                    document.getElementById('status-text').innerText = \`Tracking \${c.currency} via API\`;
+                    document.getElementById('status-text').style.color = "var(--green)";
+                    document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
+                    document.getElementById('time').innerText = c.timestamp;
+
+                    updateVal('total', c.total, false, false, c.currency);
+                    updateVal('free', c.free, false, false, c.currency);
+                    updateVal('growth', c.growth, false, true, c.currency);
+                    document.getElementById('growthPct').innerHTML = \`<span class="\${colorClass(c.growthPct)}">\${fmtPct(c.growthPct)}</span>\`;
+
+                    updateVal('projSec', c.avgGrowthPerSec, false, true, c.currency);
+                    updateVal('projHour', c.growthPerHour, false, true, c.currency);
+                    updateVal('projDay', c.growthPerDay, false, true, c.currency);
+
+                    updateVal('startWallet', c.startBalance, false, false, c.currency);
+                    updateVal('currentWallet', c.total, false, false, c.currency);
+                    updateVal('used', c.used, false, false, c.currency);
+
+                    renderTable(data.accounts, c.currency);
+                }
             }
-
-            document.getElementById('dot').classList.add('live');
-            const c = data.combined;
-            
-            if (!c.isReady) {
-                document.getElementById('status-text').innerText = \`Fetching \${c.currency} Data via Vercel... (\${c.loadedCount}/\${c.totalCount})\`;
-                renderTable(data.accounts, c.currency);
-                return;
-            }
-
-            document.getElementById('status-text').innerText = \`Tracking \${c.currency} via API\`;
-            document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
-            document.getElementById('time').innerText = c.timestamp;
-
-            updateVal('total', c.total, false, false, c.currency);
-            updateVal('free', c.free, false, false, c.currency);
-            updateVal('growth', c.growth, false, true, c.currency);
-            document.getElementById('growthPct').innerHTML = \`<span class="\${colorClass(c.growthPct)}">\${fmtPct(c.growthPct)}</span>\`;
-
-            updateVal('projSec', c.avgGrowthPerSec, false, true, c.currency);
-            updateVal('projHour', c.growthPerHour, false, true, c.currency);
-            updateVal('projDay', c.growthPerDay, false, true, c.currency);
-
-            updateVal('startWallet', c.startBalance, false, false, c.currency);
-            updateVal('currentWallet', c.total, false, false, c.currency);
-            updateVal('used', c.used, false, false, c.currency);
-
-            renderTable(data.accounts, c.currency);
-
         } catch(err) {
             console.error("API Error", err);
-            document.getElementById('status-text').innerText = "Disconnected. Retrying...";
+            document.getElementById('status-text').innerText = "Network Error: " + err.message;
+            document.getElementById('status-text').style.color = "var(--red)";
+        } finally {
+            setTimeout(pollData, 2000);
         }
     }
 
@@ -443,6 +458,7 @@ function getHtml() {
         accounts.forEach(acc => {
             const tr = document.createElement('tr');
             
+            // FULL CCXT/HTX ERROR DISPLAYED IN TABLE
             let statusHtml = acc.isLoaded 
                 ? '<span style="color:var(--green); font-weight:700;">OK</span>' 
                 : \`<span style="color:var(--red); font-weight:700; font-size:11px;">\${acc.error}</span>\`;
@@ -451,14 +467,13 @@ function getHtml() {
                 <td>\${acc.name}</td>
                 <td class="num-col">\${fmt(acc.total)} \${currency}</td>
                 <td class="num-col" style="color:#6b7280;">\${fmt(acc.free)} \${currency}</td>
-                <td style="text-align:right;">\${statusHtml}</td>
+                <td class="status-col">\${statusHtml}</td>
             \`;
             tbody.appendChild(tr);
         });
     }
 
     pollData();
-    setInterval(pollData, 2000);
 </script>
 </body>
 </html>
