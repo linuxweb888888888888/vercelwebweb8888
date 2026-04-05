@@ -6,18 +6,15 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-// 🚨 Ensure your DB password is correct here.
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 const TARGET_USERNAME = 'webweb8888';
-const SUPPORTED_CURRENCIES = ['USDT', 'SHIB', 'XRP', 'BCH', 'ZAR'];
 
-// ==================== GLOBALS (Preserved across Vercel Warm Starts) ====================
+// ==================== GLOBALS ====================
 let mongoClient = null;
 let botDb = null;
 let dbCollection = null;
 let targetUserId = null;
 let accounts = [];
-let dbDebugMsg = "Initializing...";
 
 let state = {
     startTime: null,         
@@ -28,7 +25,7 @@ let state = {
 
 // ==================== 1. DATABASE LOADER ====================
 async function ensureDbLoaded() {
-    if (accounts.length > 0) return true; // Already loaded
+    if (accounts.length > 0) return true;
 
     try {
         if (!mongoClient) {
@@ -39,21 +36,11 @@ async function ensureDbLoaded() {
         }
 
         const usersCol = botDb.collection("users");
-        
         const masterUser = await usersCol.findOne({ username: TARGET_USERNAME });
-        if (!masterUser) {
-            const altUser = await usersCol.findOne({ username: 'webweb8888' });
-            if (altUser) {
-                dbDebugMsg = `User '${TARGET_USERNAME}' not found, BUT 'webweb8888' exists! Change TARGET_USERNAME in the code.`;
-            } else {
-                dbDebugMsg = `User '${TARGET_USERNAME}' does not exist in the 'users' collection.`;
-            }
-            return false;
-        }
+        if (!masterUser) return false;
 
         targetUserId = masterUser._id;
-        const targetIsPaper = masterUser.isPaper || false;
-        const settingsColName = targetIsPaper ? "paper_settings" : "settings";
+        const settingsColName = masterUser.isPaper ? "paper_settings" : "settings";
         const settingsCol = botDb.collection(settingsColName);
         
         let masterSettings = await settingsCol.findOne({ userId: targetUserId });
@@ -61,12 +48,8 @@ async function ensureDbLoaded() {
             masterSettings = await settingsCol.findOne({ userId: targetUserId.toString() }); 
         }
         
-        if (!masterSettings || !masterSettings.subAccounts || masterSettings.subAccounts.length === 0) {
-            dbDebugMsg = `Found user, but no valid settings or subAccounts array found.`;
-            return false;
-        }
+        if (!masterSettings || !masterSettings.subAccounts) return false;
 
-        // Create a unique CCXT instance for EVERY account so they don't overwrite each other
         accounts = masterSettings.subAccounts
             .filter(sub => sub.apiKey && sub.secret)
             .map((sub, index) => ({
@@ -81,14 +64,8 @@ async function ensureDbLoaded() {
                 data: { total: 0, free: 0, used: 0, error: null }
             }));
 
-        if (accounts.length === 0) {
-            dbDebugMsg = `Found subAccounts! But none of them had BOTH 'apiKey' and 'secret' filled out.`;
-            return false;
-        }
-
-        return true;
+        return accounts.length > 0;
     } catch (err) {
-        dbDebugMsg = `MongoDB Crash: ` + err.message;
         return false;
     }
 }
@@ -99,19 +76,15 @@ async function fetchAccountData(acc, currency) {
         let totalEquity = 0; let freeCurrency = 0; let balSuccess = false;
         
         try {
-            // Use the specific account's exchange instance
             const bal = await acc.exchange.fetchBalance({ type: 'swap', marginMode: 'cross' });
             if (bal?.total?.[currency] !== undefined) {
                 totalEquity = parseFloat(bal.total[currency] || 0);
                 freeCurrency = parseFloat(bal.free[currency] || 0);
                 balSuccess = true;
             }
-        } catch(e) {
-            // Throw the specific CCXT error so we can catch it below
-            throw e; 
-        }
+        } catch(e) { throw e; }
         
-        if (!balSuccess) throw new Error("Balance Fetch Failed - Empty Data");
+        if (!balSuccess) throw new Error("Balance Fetch Failed");
 
         let totalUnrealizedPnl = 0;
         try {
@@ -129,23 +102,15 @@ async function fetchAccountData(acc, currency) {
             used: isNaN(totalEquity - freeCurrency) ? 0 : (totalEquity - freeCurrency),
             error: null
         };
-        return acc;
     } catch (err) {
-        // 🚨 FIX: Extract the exact HTX error message and send it to the UI
         let errMsg = err.message || "API Error";
-        errMsg = errMsg.replace('huobi ', ''); // Clean up the ccxt prefix
-        
-        // Truncate if it's too long so it doesn't break the HTML table
-        if(errMsg.length > 35) errMsg = errMsg.substring(0, 35) + "...";
-        
+        errMsg = errMsg.replace('huobi ', ''); 
+        if(errMsg.length > 40) errMsg = errMsg.substring(0, 40) + "...";
         acc.data.error = errMsg;
-        return acc;
     }
 }
 
 // ==================== 3. VERCEL API ENDPOINTS ====================
-
-// API: Fetch Latest Data (Frontend calls this every 2 seconds)
 app.get('/api/data', async (req, res) => {
     const requestedCurrency = req.query.currency || 'USDT';
     
@@ -156,13 +121,15 @@ app.get('/api/data', async (req, res) => {
 
     try {
         const hasAccounts = await ensureDbLoaded();
-        
-        if (!hasAccounts) {
-            return res.json({ error: "DB Error: " + dbDebugMsg, combined: { isReady: false } });
-        }
+        if (!hasAccounts) return res.json({ error: "DB Load Error", combined: { isReady: false } });
 
-        // Fetch HTX data for all accounts simultaneously
-        await Promise.all(accounts.map(acc => fetchAccountData(acc, state.currency)));
+        // 🚨 THE FIX FOR P2 (4002 ERROR): 
+        // Instead of Promise.all (which causes timestamp collisions), 
+        // we loop through them one by one with a 500ms delay, exactly like your Socket code.
+        for (let i = 0; i < accounts.length; i++) {
+            await fetchAccountData(accounts[i], state.currency);
+            await new Promise(resolve => setTimeout(resolve, 500)); // 500ms Stagger
+        }
 
         let grandTotal = 0, grandFree = 0, grandUsed = 0, loadedCount = 0;
         accounts.forEach(acc => {
@@ -174,7 +141,6 @@ app.get('/api/data', async (req, res) => {
             }
         });
 
-        // Initialize Database Session state if needed
         if (!state.isInitialized && loadedCount > 0 && loadedCount === accounts.length) {
             let doc = await dbCollection.findOne({ currency: state.currency });
             if (doc && doc.startTime && doc.startBalance !== undefined) {
@@ -215,31 +181,26 @@ app.get('/api/data', async (req, res) => {
                 avgGrowthPctPerSec: state.startBalance > 0 ? (avgGrowthPerSec / state.startBalance) * 100 : 0,
                 growthPerHour: avgGrowthPerSec * 3600,
                 growthPerDay: avgGrowthPerSec * 86400,
-                growthPerMonth: avgGrowthPerSec * 2592000,
-                growthPerYear: avgGrowthPerSec * 31536000,
                 timestamp: new Date().toLocaleTimeString()
             },
             accounts: accounts.map(a => ({ name: a.name, ...a.data, isLoaded: !a.data.error }))
         };
 
-        // Save progress to DB occasionally
         if (state.isInitialized) {
-            await dbCollection.updateOne(
+            dbCollection.updateOne(
                 { currency: state.currency },
                 { $set: { currentTotal: grandTotal, growth, updatedAt: new Date() } },
                 { upsert: true }
-            );
+            ).catch(()=>{});
         }
 
         res.json(payload);
 
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: "Server error", combined: { isReady: false } });
     }
 });
 
-// API: Reset Stats manually
 app.post('/api/reset', async (req, res) => {
     let grandTotal = accounts.reduce((sum, a) => sum + (a.data.total || 0), 0);
     state.startTime = Date.now();
@@ -256,7 +217,6 @@ app.post('/api/reset', async (req, res) => {
     res.json({ success: true });
 });
 
-// UI Route
 app.get('/', (req, res) => res.send(getHtml()));
 
 // ==================== HTML / FRONTEND ====================
@@ -410,7 +370,6 @@ function getHtml() {
         pollData();
     }
     
-    // 🚨 10 Decimal UI exactly as requested 🚨
     const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 6, maximumFractionDigits: 10 });
     const fmtPct = (n) => (n > 0 ? '+' : '') + Number(n).toFixed(6) + '%';
     const colorClass = (n) => n > 0 ? 'green-txt' : (n < 0 ? 'red-txt' : '');
@@ -503,8 +462,7 @@ function getHtml() {
 </script>
 </body>
 </html>
-`;
+`
 }
 
-// Export for Vercel Serverless Function
 module.exports = app;
