@@ -8,7 +8,7 @@ app.use(express.json());
 // ==================== CONFIGURATION ====================
 // 🚨 Ensure your DB password is correct here.
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-const TARGET_USERNAME = 'webwebwebweb8888'; 
+const TARGET_USERNAME = 'webweb8888'; 
 const SUPPORTED_CURRENCIES = ['USDT', 'SHIB', 'XRP', 'BCH', 'ZAR'];
 
 // ==================== GLOBALS (Preserved across Vercel Warm Starts) ====================
