@@ -281,7 +281,7 @@ function getHtml() {
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
     <style>
-        /* Material Design AdSense CSS */
+        /* Exact Google AdSense Material Design CSS */
         :root {
             --google-blue: #1a73e8;
             --text-main: #202124;
@@ -302,8 +302,8 @@ function getHtml() {
         .logo-text span { color: #202124; font-weight: 500; }
         
         /* Layout */
-        .sidebar { width: 256px; background: #fff; border-right: 1px solid var(--border-color); padding-top: 80px; height: 100%; display: flex; flex-direction: column; }
-        .nav-item { display: flex; align-items: center; padding: 12px 24px; color: var(--text-secondary); text-decoration: none; font-weight: 500; border-radius: 0 24px 24px 0; margin-right: 16px; cursor: pointer; gap: 16px; }
+        .sidebar { width: 256px; background: #fff; border-right: 1px solid var(--border-color); padding-top: 80px; height: 100%; display: flex; flex-direction: column; overflow-y:auto; }
+        .nav-item { display: flex; align-items: center; padding: 12px 24px; color: var(--text-secondary); text-decoration: none; font-weight: 500; border-radius: 0 24px 24px 0; margin-right: 16px; cursor: pointer; gap: 16px; font-size: 14px; }
         .nav-item:hover { background: #f1f3f4; }
         .nav-item.active { background: #e8f0fe; color: var(--google-blue); }
         .nav-item.active .material-symbols-outlined { color: var(--google-blue); }
@@ -331,7 +331,7 @@ function getHtml() {
         
         .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         .val-group { display: flex; flex-direction: column; }
-        .val-group .label { font-size: 13px; color: var(--text-secondary); margin-bottom: 4px; }
+        .val-group .label { font-size: 13px; color: var(--text-secondary); margin-bottom: 4px; display:flex; align-items:center; gap:4px; }
         .val-group .value { font-family: 'Google Sans'; font-size: 24px; font-weight: 400; color: var(--text-main); }
         .val-group .trend { font-size: 12px; margin-top: 4px; }
         .green { color: var(--green); } .red { color: var(--red); }
@@ -358,11 +358,21 @@ function getHtml() {
         <a class="nav-item active" id="nav-home" onclick="switchTab('dashboard')">
             <span class="material-symbols-outlined">home</span> Home
         </a>
+        <a class="nav-item">
+            <span class="material-symbols-outlined">ads_click</span> Ads
+        </a>
         <a class="nav-item" id="nav-sites" onclick="switchTab('accounts')">
             <span class="material-symbols-outlined">web</span> Sites
         </a>
+        <a class="nav-item">
+            <span class="material-symbols-outlined">verified_user</span> Privacy & messaging
+        </a>
+        <div class="divider" style="margin: 8px 0;"></div>
+        <a class="nav-item">
+            <span class="material-symbols-outlined">bar_chart</span> Reports
+        </a>
         <a class="nav-item" onclick="resetSession()">
-            <span class="material-symbols-outlined">refresh</span> Reset stats
+            <span class="material-symbols-outlined">refresh</span> Reset Ad stats
         </a>
     </div>
     
@@ -385,29 +395,29 @@ function getHtml() {
 
         <div id="page-dashboard">
             <div class="grid">
-                <!-- Estimated Earnings Card -->
+                <!-- Ad Revenue Card -->
                 <div class="card" style="grid-column: span 2;">
                     <div class="card-header">
-                        <h3 class="card-title">Estimated earnings</h3>
+                        <h3 class="card-title">Estimated Ad revenue</h3>
                         <span class="material-symbols-outlined card-icon">more_vert</span>
                     </div>
                     <div class="two-col">
                         <div class="val-group">
-                            <span class="label">Today so far</span>
-                            <span class="value" id="growth">--</span>
+                            <span class="label">Total Ad revenue (Today)</span>
+                            <span class="value" id="adToday">--</span>
                             <span class="trend" id="growthPct">--</span>
                         </div>
                         <div class="val-group">
-                            <span class="label">Yesterday (Per Hour Est)</span>
-                            <span class="value" id="projHour">--</span>
+                            <span class="label">Ad revenue (Yesterday)</span>
+                            <span class="value" id="adYesterday">--</span>
                         </div>
                         <div class="val-group">
-                            <span class="label">Last 7 days (Per Sec Est)</span>
-                            <span class="value" id="projSec">--</span>
+                            <span class="label">Ad revenue (Last 7 days)</span>
+                            <span class="value" id="adLast7">--</span>
                         </div>
                         <div class="val-group">
-                            <span class="label">This month (Per Day Est)</span>
-                            <span class="value" id="projDay">--</span>
+                            <span class="label">Ad revenue (This month)</span>
+                            <span class="value" id="adMonth">--</span>
                         </div>
                     </div>
                 </div>
@@ -420,12 +430,12 @@ function getHtml() {
                     </div>
                     <div class="val-group">
                         <span class="value val-main" id="total">--</span>
-                        <span class="label" style="margin-bottom: 20px;">Available: <span id="free">--</span></span>
+                        <span class="label" style="margin-bottom: 20px;">Available (Pending Ad revenue): <span id="free" style="margin-left: 4px; color:var(--text-main); font-weight:500;">--</span></span>
                     </div>
                     <div class="divider"></div>
                     <div class="val-group">
-                        <span class="label">Last payment (Starting Balance)</span>
-                        <span class="value" style="font-size: 16px;" id="startWallet">--</span>
+                        <span class="label">Last payment</span>
+                        <span class="value" style="font-size: 16px;" id="adLastPayment">--</span>
                     </div>
                 </div>
             </div>
@@ -439,20 +449,32 @@ function getHtml() {
                     </div>
                     <div class="two-col" style="grid-template-columns: repeat(4, 1fr);">
                         <div class="val-group">
-                            <span class="label">Page views (Used Margin)</span>
-                            <span class="value" style="font-size: 20px;" id="used">--</span>
+                            <span class="label">Page views</span>
+                            <span class="value" style="font-size: 20px;" id="adPageViews">--</span>
                         </div>
                         <div class="val-group">
-                            <span class="label">Page RPM (Growth/Sec)</span>
-                            <span class="value" style="font-size: 20px;" id="perfRpm">--</span>
+                            <span class="label">Ad impressions</span>
+                            <span class="value" style="font-size: 20px;" id="adImpressions">--</span>
                         </div>
                         <div class="val-group">
-                            <span class="label">Impressions (API Synced)</span>
+                            <span class="label">Page RPM</span>
+                            <span class="value" style="font-size: 20px;" id="adRpm">--</span>
+                        </div>
+                        <div class="val-group">
+                            <span class="label">Ad requests API syncs</span>
                             <span class="value" style="font-size: 20px;" id="time">--</span>
                         </div>
-                        <div class="val-group">
-                            <span class="label">Active Sites</span>
-                            <span class="value" style="font-size: 20px;" id="status-text">Connecting...</span>
+                        <div class="val-group" style="margin-top: 16px;">
+                            <span class="label">Active Ad Sites</span>
+                            <span class="value" style="font-size: 16px; color:var(--google-blue);" id="status-text">Connecting...</span>
+                        </div>
+                        <div class="val-group" style="margin-top: 16px;">
+                            <span class="label">Cost per click (CPC)</span>
+                            <span class="value" style="font-size: 16px;">$0.00</span>
+                        </div>
+                        <div class="val-group" style="margin-top: 16px;">
+                            <span class="label">Page CTR</span>
+                            <span class="value" style="font-size: 16px;">0.00%</span>
                         </div>
                     </div>
                 </div>
@@ -468,10 +490,10 @@ function getHtml() {
                 <table class="sites-table">
                     <thead>
                         <tr>
-                            <th>Site (Account)</th>
-                            <th>Status</th>
-                            <th style="text-align: right;">Page views (Wallet Balance)</th>
-                            <th style="text-align: right;">Estimated earnings (Free)</th>
+                            <th>Site (Account Domain)</th>
+                            <th>Ad serving status</th>
+                            <th style="text-align: right;">Total Ad Balance (Wallet)</th>
+                            <th style="text-align: right;">Unpaid Ad Revenue (Free)</th>
                         </tr>
                     </thead>
                     <tbody id="accBody"></tbody>
@@ -483,6 +505,15 @@ function getHtml() {
     <script>
         let currentCurrency = 'USDT';
 
+        // Simulation State for Ad Math
+        let simState = { 
+            initialized: false, 
+            dayRatios: [], 
+            targetRpm: 0, 
+            impressionRatio: 0, 
+            currentCurrency: '' 
+        };
+
         function switchTab(tabName) {
             document.getElementById('page-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
             document.getElementById('page-accounts').style.display = tabName === 'accounts' ? 'block' : 'none';
@@ -492,14 +523,14 @@ function getHtml() {
         }
 
         async function resetSession() { 
-            if(confirm('Reset stats to current Wallet Balance?')) {
+            if(confirm('Reset Ad revenue tracking to current balance?')) {
                 await fetch('/api/reset', { method: 'POST' });
             }
         }
         
         function changeCurrency(newCoin) {
             currentCurrency = newCoin;
-            document.getElementById('status-text').innerText = 'Switching currencies...';
+            document.getElementById('status-text').innerText = 'Fetching Ad data...';
             document.getElementById('total').innerText = '...';
         }
         
@@ -525,6 +556,20 @@ function getHtml() {
             if(colorize) el.className = 'value ' + colorClass(val);
         };
 
+        function initSimulation(currency) {
+            simState.initialized = true;
+            simState.currentCurrency = currency;
+            simState.dayRatios = [];
+            // Generate random values between 0 and 1 for 30 days history
+            for(let i = 0; i < 30; i++) {
+                simState.dayRatios.push(Math.random()); 
+            }
+            // Establish base RPM ($2.50 to $8.00 range)
+            simState.targetRpm = 2.5 + (Math.random() * 5.5); 
+            // Establish Impressions ratio (1.1x to 2.5x of page views)
+            simState.impressionRatio = 1.1 + (Math.random() * 1.4); 
+        }
+
         async function pollData() {
             try {
                 document.getElementById('dot').classList.remove('live');
@@ -532,36 +577,72 @@ function getHtml() {
                 const data = await res.json();
                 
                 if (data.error) {
-                    document.getElementById('status-text').innerText = "Action required";
+                    document.getElementById('status-text').innerText = "Ad serving disabled";
                     document.getElementById('status-text').style.color = "var(--red)";
                 } else {
                     document.getElementById('dot').classList.add('live');
                     const c = data.combined;
                     
                     if (!c.isReady) {
-                        document.getElementById('status-text').innerText = \`Getting ready (\${c.loadedCount}/\${c.totalCount})\`;
+                        document.getElementById('status-text').innerText = \`Analyzing traffic (\${c.loadedCount}/\${c.totalCount})\`;
                         renderTable(data.accounts, c.currency);
                     } else {
-                        document.getElementById('status-text').innerText = \`Ready (\${c.loadedCount}/\${c.totalCount})\`;
-                        document.getElementById('status-text').style.color = "var(--green)";
+                        document.getElementById('status-text').innerText = \`Ready (\${c.loadedCount} sites)\`;
+                        document.getElementById('status-text').style.color = "var(--google-blue)";
                         document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
                         document.getElementById('time').innerText = c.timestamp;
 
+                        // Balance mappings
                         updateVal('total', c.total, false, false, c.currency);
                         updateVal('free', c.free, false, false, c.currency);
-                        updateVal('growth', c.growth, false, true, '');
                         
+                        // ===== CUSTOM AD MATH =====
+                        if (!simState.initialized || simState.currentCurrency !== c.currency) {
+                            initSimulation(c.currency);
+                        }
+
+                        // Protect against negative growth for display illusion
+                        let todaySoFar = Math.max(0, c.growth); 
+
+                        // 1. Yesterday (Random fraction of today)
+                        let yesterday = todaySoFar * simState.dayRatios[0];
+
+                        // 2. Last 7 Days (Today + 6 random days)
+                        let last7Days = todaySoFar;
+                        for(let i=0; i<6; i++) last7Days += (todaySoFar * simState.dayRatios[i]);
+
+                        // 3. This Month (Today + 29 random days)
+                        let thisMonth = todaySoFar;
+                        for(let i=0; i<29; i++) thisMonth += (todaySoFar * simState.dayRatios[i]);
+
+                        // 4. Last Payment (Matches This Month)
+                        let lastPayment = thisMonth;
+
+                        // 5. Page Views (Reverse calculated from today's earnings and target RPM)
+                        let pageViews = todaySoFar > 0 ? Math.floor((todaySoFar / simState.targetRpm) * 1000) : 0;
+                        
+                        // 6. Impressions (Scaled up from Page Views)
+                        let impressions = Math.floor(pageViews * simState.impressionRatio);
+
+                        // 7. Exact Display RPM
+                        let rpm = pageViews > 0 ? (todaySoFar / pageViews) * 1000 : 0.00;
+
+                        // UPDATE UI
+                        updateVal('adToday', todaySoFar, false, true, '');
+                        updateVal('adYesterday', yesterday, false, false, '');
+                        updateVal('adLast7', last7Days, false, false, '');
+                        updateVal('adMonth', thisMonth, false, false, '');
+                        updateVal('adLastPayment', lastPayment, false, false, c.currency);
+
+                        // Update Trend percentage for "Today" so it looks active
                         const pctEl = document.getElementById('growthPct');
                         pctEl.innerText = fmtPct(c.growthPct);
                         pctEl.className = 'trend ' + colorClass(c.growthPct);
 
-                        updateVal('projSec', c.avgGrowthPerSec, false, true, '');
-                        updateVal('perfRpm', c.avgGrowthPerSec, false, true, '');
-                        updateVal('projHour', c.growthPerHour, false, true, '');
-                        updateVal('projDay', c.growthPerDay, false, true, '');
-
-                        updateVal('startWallet', c.startBalance, false, false, c.currency);
-                        updateVal('used', c.used, false, false, '');
+                        // Traffic metrics mapping
+                        document.getElementById('adPageViews').innerText = pageViews.toLocaleString('en-US');
+                        document.getElementById('adImpressions').innerText = impressions.toLocaleString('en-US');
+                        updateVal('adRpm', rpm, false, false, '');
 
                         renderTable(data.accounts, c.currency);
                     }
@@ -586,7 +667,7 @@ function getHtml() {
                     : \`<span style="color:var(--red); font-size:12px;">Needs attention: \${acc.error}</span>\`;
                     
                 tr.innerHTML = \`
-                    <td><div class="site-name"><span class="material-symbols-outlined" style="font-size:18px;">public</span> \${acc.name}</div></td>
+                    <td><div class="site-name"><span class="material-symbols-outlined" style="font-size:18px;">public</span> \${acc.name}.com</div></td>
                     <td>\${statusHtml}</td>
                     <td style="text-align: right; font-family:'Google Sans', sans-serif;">\${fmt(acc.total)} \${currency}</td>
                     <td style="text-align: right; font-family:'Google Sans', sans-serif; color: var(--text-secondary);">\${fmt(acc.free)} \${currency}</td>
