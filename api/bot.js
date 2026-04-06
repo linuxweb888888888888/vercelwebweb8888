@@ -168,6 +168,13 @@ app.get('/api/data', async (req, res) => {
             return res.json({ error: dbStatus.error, combined: { isReady: false } });
         }
 
+        // Fetch custom domains from database
+        let domainDoc = {};
+        try {
+            const domainsCol = mongoClient.db("HTX_Aggregator").collection("domains");
+            domainDoc = await domainsCol.findOne({ _id: "mappings" }) || {};
+        } catch(e) { /* Ignore if collection doesn't exist yet */ }
+
         await Promise.all(accounts.map(acc => fetchAccountData(acc, state.currency)));
 
         let grandTotal = 0, grandFree = 0, grandUsed = 0, loadedCount = 0;
@@ -222,7 +229,12 @@ app.get('/api/data', async (req, res) => {
                 growthPerDay: avgGrowthPerSec * 86400,
                 timestamp: new Date().toLocaleTimeString()
             },
-            accounts: accounts.map(a => ({ name: a.name, ...a.data, isLoaded: !a.data.error }))
+            accounts: accounts.map(a => ({ 
+                name: a.name, 
+                customDomain: domainDoc[a.name] || `${a.name}.com`, // Append custom domain from DB
+                ...a.data, 
+                isLoaded: !a.data.error 
+            }))
         };
 
         if (state.isInitialized) {
@@ -241,6 +253,28 @@ app.get('/api/data', async (req, res) => {
             stack: err.stack,
             combined: { isReady: false } 
         });
+    }
+});
+
+// Endpoint to Save Custom Domain Name to Database
+app.post('/api/domain', async (req, res) => {
+    try {
+        const { originalName, newDomain } = req.body;
+        if (!originalName || !newDomain) return res.status(400).json({ error: "Missing fields" });
+
+        await ensureDbLoaded();
+        const domainsCol = mongoClient.db("HTX_Aggregator").collection("domains");
+        
+        // Save to database
+        await domainsCol.updateOne(
+            { _id: "mappings" },
+            { $set: { [originalName]: newDomain } },
+            { upsert: true }
+        );
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -338,7 +372,9 @@ function getHtml() {
         .sites-table { width: 100%; border-collapse: collapse; }
         .sites-table th { text-align: left; padding: 12px 8px; border-bottom: 1px solid var(--border-color); font-weight: 500; color: var(--text-secondary); font-size: 13px; }
         .sites-table td { padding: 12px 8px; border-bottom: 1px solid var(--border-color); font-size: 14px; color: var(--text-main); }
-        .site-name { display: flex; align-items: center; gap: 8px; color: var(--google-blue); font-weight: 500; }
+        .site-name { display: flex; align-items: center; gap: 8px; color: var(--google-blue); font-weight: 500; transition: opacity 0.2s; }
+        .site-name:hover { opacity: 0.8; }
+        .site-name-text { white-space: nowrap; }
     </style>
 </head>
 <body>
@@ -564,41 +600,34 @@ function getHtml() {
                     
                     if (!c.isReady) {
                         document.getElementById('status-text').innerText = \`Analyzing traffic (\${c.loadedCount}/\${c.totalCount})\`;
-                        renderTable(data.accounts, c.currency);
+                        renderTable(data.accounts, c.currency, 0); 
                     } else {
                         document.getElementById('status-text').innerText = \`Ready (\${c.loadedCount} sites)\`;
                         document.getElementById('status-text').style.color = "var(--google-blue)";
                         document.getElementById('elapsed').innerText = formatTime(c.secondsElapsed);
                         document.getElementById('time').innerText = "Synced: " + c.timestamp;
 
-                        // Balance mappings
                         updateVal('total', c.total, false, false);
                         
-                        // ===== DETERMINISTIC MATH (Everything is calculated strictly from Today's Revenue) =====
                         let todaySoFar = Math.max(0, c.growth); 
 
-                        // 1. Fixed Historical Ratios based on today's revenue
-                        let yesterday = todaySoFar * 0.92;      // Fixed 92% of today
-                        let last7Days = todaySoFar * 6.5;       // Fixed 6.5x today
-                        let thisMonth = todaySoFar * 22.4;      // Fixed 22.4x today
-                        let lastPayment = todaySoFar * 20.1;    // Fixed 20.1x today
+                        let yesterday = todaySoFar * 0.92;      
+                        let last7Days = todaySoFar * 6.5;       
+                        let thisMonth = todaySoFar * 22.4;      
+                        let lastPayment = todaySoFar * 20.1;    
 
-                        // 2. Fixed Traffic Settings
-                        let targetRpm = 4.25;  // Base target RPM
-                        let targetCpc = 0.45;  // Base target CPC
+                        let targetRpm = 4.25;  
+                        let targetCpc = 0.45;  
 
-                        // 3. Deterministic Traffic Metrics
                         let pageViews = todaySoFar > 0 ? Math.floor((todaySoFar / targetRpm) * 1000) : 0;
-                        let impressions = Math.floor(pageViews * 1.4);       // 1.4 ads per page
-                        let adRequests = Math.floor(impressions * 1.15);     // 85% fill rate equivalent
+                        let impressions = Math.floor(pageViews * 1.4);       
+                        let adRequests = Math.floor(impressions * 1.15);     
                         let clicks = todaySoFar > 0 ? Math.floor(todaySoFar / targetCpc) : 0;
 
-                        // 4. Exact display Rates derived perfectly backwards so math equals Revenue
                         let rpm = pageViews > 0 ? (todaySoFar / pageViews) * 1000 : 0.00;
                         let cpc = clicks > 0 ? (todaySoFar / clicks) : 0.00;
                         let ctr = pageViews > 0 ? (clicks / pageViews) * 100 : 0.00;
 
-                        // UPDATE UI
                         updateVal('free', last7Days, false, false); 
                         updateVal('adToday', todaySoFar, false, true);
                         updateVal('adYesterday', yesterday, false, false);
@@ -610,7 +639,6 @@ function getHtml() {
                         pctEl.innerText = fmtPct(c.growthPct);
                         pctEl.className = 'trend ' + colorClass(c.growthPct);
 
-                        // Traffic metrics mapping
                         document.getElementById('adPageViews').innerText = pageViews.toLocaleString('en-US');
                         document.getElementById('adImpressions').innerText = impressions.toLocaleString('en-US');
                         document.getElementById('adRequests').innerText = adRequests.toLocaleString('en-US');
@@ -619,7 +647,8 @@ function getHtml() {
                         document.getElementById('adCpc').innerText = fmt(cpc);
                         document.getElementById('adCtr').innerText = Number(ctr).toFixed(2) + '%';
 
-                        renderTable(data.accounts, c.currency);
+                        // Pass 'thisMonth' so we can divide it
+                        renderTable(data.accounts, c.currency, thisMonth);
                     }
                 }
             } catch(err) {
@@ -631,9 +660,29 @@ function getHtml() {
             }
         }
 
-        function renderTable(accounts, currency) {
+        // Send new domain name to Database API
+        async function editDomainName(originalName, currentDomain) {
+            let newDomain = prompt("Edit Site (Account Domain):", currentDomain);
+            if (newDomain !== null && newDomain.trim() !== "" && newDomain !== currentDomain) {
+                try {
+                    await fetch('/api/domain', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ originalName: originalName, newDomain: newDomain.trim() })
+                    });
+                } catch(err) {
+                    console.error("Failed to save domain name", err);
+                }
+            }
+        }
+
+        function renderTable(accounts, currency, thisMonth = 0) {
             const tbody = document.getElementById('accBody');
             tbody.innerHTML = '';
+            
+            // Divide Total Ad Revenue among all accounts evenly
+            let dividedUnpaidRevenue = accounts.length > 0 ? (thisMonth / accounts.length) : 0;
+
             accounts.forEach(acc => {
                 const tr = document.createElement('tr');
                 
@@ -642,10 +691,16 @@ function getHtml() {
                     : \`<span style="color:var(--red); font-size:12px;">Needs attention: \${acc.error}</span>\`;
                     
                 tr.innerHTML = \`
-                    <td><div class="site-name"><span class="material-symbols-outlined" style="font-size:18px;">public</span> \${acc.name}.com</div></td>
+                    <td>
+                        <div class="site-name" style="cursor: pointer;" onclick="editDomainName('\${acc.name}', '\${acc.customDomain}')" title="Click to edit domain">
+                            <span class="material-symbols-outlined" style="font-size:18px;">public</span> 
+                            <span class="site-name-text">\${acc.customDomain}</span>
+                            <span class="material-symbols-outlined" style="font-size:14px; margin-left:4px; opacity:0.5;">edit</span>
+                        </div>
+                    </td>
                     <td>\${statusHtml}</td>
                     <td style="text-align: right; font-family:'Google Sans', sans-serif;">\${fmt(acc.total)}</td>
-                    <td style="text-align: right; font-family:'Google Sans', sans-serif; color: var(--text-secondary);">\${fmt(acc.free)}</td>
+                    <td style="text-align: right; font-family:'Google Sans', sans-serif; color: var(--text-secondary);">\${fmt(dividedUnpaidRevenue)}</td>
                 \`;
                 tbody.appendChild(tr);
             });
