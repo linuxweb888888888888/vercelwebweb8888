@@ -227,6 +227,8 @@ app.get('/api/data', async (req, res) => {
                 avgGrowthPctPerSec: state.startBalance > 0 ? (avgGrowthPerSec / state.startBalance) * 100 : 0,
                 growthPerHour: avgGrowthPerSec * 3600,
                 growthPerDay: avgGrowthPerSec * 86400,
+                growthPerMonth: avgGrowthPerSec * 86400 * 30, // 30 day avg
+                growthPerYear: avgGrowthPerSec * 86400 * 365, // 365 day avg
                 timestamp: new Date().toLocaleTimeString()
             },
             accounts: accounts.map(a => ({ 
@@ -475,12 +477,12 @@ function getHtml() {
 
             <div class="grid">
                 <!-- Performance Card -->
-                <div class="card" style="grid-column: span 3;">
+                <div class="card" style="grid-column: span 2;">
                     <div class="card-header">
                         <h3 class="card-title">Performance</h3>
                         <span class="material-symbols-outlined card-icon">more_vert</span>
                     </div>
-                    <div class="two-col" style="grid-template-columns: repeat(4, 1fr);">
+                    <div class="two-col" style="grid-template-columns: repeat(3, 1fr);">
                         <div class="val-group">
                             <span class="label">Page views</span>
                             <span class="value" style="font-size: 20px;" id="adPageViews">--</span>
@@ -493,13 +495,9 @@ function getHtml() {
                             <span class="label">Page RPM</span>
                             <span class="value" style="font-size: 20px;" id="adRpm">--</span>
                         </div>
-                        <div class="val-group">
+                        <div class="val-group" style="margin-top: 16px;">
                             <span class="label">Ad requests</span>
                             <span class="value" style="font-size: 20px;" id="adRequests">--</span>
-                        </div>
-                        <div class="val-group" style="margin-top: 16px;">
-                            <span class="label">Active Ad Sites</span>
-                            <span class="value" style="font-size: 16px; color:var(--google-blue);" id="status-text">Connecting...</span>
                         </div>
                         <div class="val-group" style="margin-top: 16px;">
                             <span class="label">Cost per click (CPC)</span>
@@ -509,6 +507,30 @@ function getHtml() {
                             <span class="label">Page CTR</span>
                             <span class="value" style="font-size: 16px;" id="adCtr">--</span>
                         </div>
+                        <div class="val-group" style="margin-top: 16px;">
+                            <span class="label">Active Ad Sites</span>
+                            <span class="value" style="font-size: 16px; color:var(--google-blue);" id="status-text">Connecting...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- NEW Forecast / Projections Card -->
+                <div class="card" style="grid-column: span 1;">
+                    <div class="card-header">
+                        <h3 class="card-title">Projected Ad revenue</h3>
+                        <span class="material-symbols-outlined card-icon">more_vert</span>
+                    </div>
+                    <div class="val-group" style="margin-bottom: 20px;">
+                        <span class="label">Estimated (Per Day)</span>
+                        <span class="value" id="estDay" style="font-size: 20px;">--</span>
+                    </div>
+                    <div class="val-group" style="margin-bottom: 20px;">
+                        <span class="label">Estimated (Per Month)</span>
+                        <span class="value" id="estMonth" style="font-size: 20px;">--</span>
+                    </div>
+                    <div class="val-group">
+                        <span class="label">Estimated (Per Year)</span>
+                        <span class="value" id="estYear" style="font-size: 20px;">--</span>
                     </div>
                 </div>
             </div>
@@ -646,6 +668,11 @@ function getHtml() {
                         updateVal('adRpm', rpm, false, false);
                         document.getElementById('adCpc').innerText = fmt(cpc);
                         document.getElementById('adCtr').innerText = Number(ctr).toFixed(2) + '%';
+
+                        // NEW: Update Estimates based on True Growth per Time
+                        updateVal('estDay', c.growthPerDay, false, true);
+                        updateVal('estMonth', c.growthPerMonth, false, true);
+                        updateVal('estYear', c.growthPerYear, false, true);
 
                         // Pass 'thisMonth' so we can divide it
                         renderTable(data.accounts, c.currency, thisMonth);
