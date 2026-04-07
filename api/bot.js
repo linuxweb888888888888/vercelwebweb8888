@@ -23,7 +23,8 @@ let state = {
     startTime: null,         
     startBalance: 0,      
     isInitialized: false,
-    currency: 'USDT'
+    currency: 'USDT',
+    lastChartSave: null
 };
 
 // ==================== 1. DATABASE LOADER ====================
@@ -154,7 +155,8 @@ async function fetchAccountData(acc, currency) {
 }
 
 // ==================== 3. VERCEL API ENDPOINTS ====================
-app.get('/api/data', async (req, res) => {
+// Map both /api/data and /api/ping to the exact same logic
+app.get(['/api/data', '/api/ping'], async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
     const requestedCurrency = req.query.currency || 'USDT';
@@ -209,6 +211,7 @@ app.get('/api/data', async (req, res) => {
         const now = Date.now();
         const secondsElapsed = state.isInitialized ? Math.max(1, (now - state.startTime) / 1000) : 0;
         const growth = state.isInitialized ? (grandTotal - state.startBalance) : 0;
+        const growthPct = state.startBalance > 0 ? (growth / state.startBalance) * 100 : 0;
         const avgGrowthPerSec = state.isInitialized ? (growth / secondsElapsed) : 0;
 
         const payload = {
@@ -224,7 +227,7 @@ app.get('/api/data', async (req, res) => {
                 startTime: state.startTime,
                 secondsElapsed,
                 growth,
-                growthPct: state.startBalance > 0 ? (growth / state.startBalance) * 100 : 0,
+                growthPct,
                 avgGrowthPerSec,
                 avgGrowthPctPerSec: state.startBalance > 0 ? (avgGrowthPerSec / state.startBalance) * 100 : 0,
                 growthPerHour: avgGrowthPerSec * 3600,
@@ -247,6 +250,16 @@ app.get('/api/data', async (req, res) => {
                 { $set: { currentTotal: grandTotal, growth, updatedAt: new Date() } },
                 { upsert: true }
             ).catch(()=>{});
+
+            // === 24/7 DB CHART TRACKING LOGIC (Triggers via browser OR cron job) ===
+            // Save a data point to DB max once every 60 seconds
+            if (!state.lastChartSave || (now - state.lastChartSave >= 60000)) {
+                state.lastChartSave = now;
+                const chartCol = mongoClient.db("HTX_Aggregator").collection("chart_history");
+                chartCol.insertOne({ currency: state.currency, time: now, value: growthPct }).catch(()=>{});
+                // Delete data older than 10 hours to keep DB clean
+                chartCol.deleteMany({ time: { $lt: now - 36000000 } }).catch(()=>{});
+            }
         }
 
         res.json(payload);
@@ -260,6 +273,19 @@ app.get('/api/data', async (req, res) => {
     }
 });
 
+// Endpoint to fetch history from database for the Frontend Chart
+app.get('/api/chart', async (req, res) => {
+    try {
+        const currency = req.query.currency || 'USDT';
+        await ensureDbLoaded();
+        const chartCol = mongoClient.db("HTX_Aggregator").collection("chart_history");
+        const history = await chartCol.find({ currency }).sort({ time: 1 }).toArray();
+        res.json(history.map(d => ({ time: d.time, value: d.value })));
+    } catch (err) {
+        res.status(500).json([]);
+    }
+});
+
 // Endpoint to Save Custom Domain Name to Database
 app.post('/api/domain', async (req, res) => {
     try {
@@ -269,7 +295,6 @@ app.post('/api/domain', async (req, res) => {
         await ensureDbLoaded();
         const domainsCol = mongoClient.db("HTX_Aggregator").collection("domains");
         
-        // Save to database
         await domainsCol.updateOne(
             { _id: "mappings" },
             { $set: { [originalName]: newDomain } },
@@ -296,6 +321,9 @@ app.post('/api/reset', async (req, res) => {
             { $set: { startTime: state.startTime, startBalance: state.startBalance } },
             { upsert: true }
         );
+        // Clear chart history for this coin on reset
+        const chartCol = mongoClient.db("HTX_Aggregator").collection("chart_history");
+        await chartCol.deleteMany({ currency: state.currency });
     }
     res.json({ success: true });
 });
@@ -574,26 +602,23 @@ function getHtml() {
     <script>
         let currentCurrency = 'USDT';
         let revenueChart;
-        let chartData = JSON.parse(localStorage.getItem('revenue_pct_chart_data_' + currentCurrency) || '[]');
+        let chartData = [];
 
         function initChart() {
             const ctx = document.getElementById('revenueChart').getContext('2d');
             revenueChart = new Chart(ctx, {
                 type: 'line',
-                data: {
-                    labels: chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})),
-                    datasets: [{
-                        label: 'Revenue Growth (%)',
-                        data: chartData.map(d => d.value),
-                        borderColor: '#1a73e8',
-                        backgroundColor: 'rgba(26, 115, 232, 0.1)',
-                        borderWidth: 2,
-                        fill: true,
-                        pointRadius: 0,
-                        pointHoverRadius: 4,
-                        tension: 0.4
-                    }]
-                },
+                data: { labels: [], datasets: [{
+                    label: 'Revenue Growth (%)',
+                    data: [],
+                    borderColor: '#1a73e8',
+                    backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    tension: 0.4
+                }]},
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
@@ -613,6 +638,18 @@ function getHtml() {
             });
         }
 
+        async function fetchChartHistory() {
+            try {
+                const res = await fetch('/api/chart?currency=' + currentCurrency);
+                chartData = await res.json();
+                if (revenueChart) {
+                    revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
+                    revenueChart.data.datasets[0].data = chartData.map(d => d.value);
+                    revenueChart.update();
+                }
+            } catch(e) { console.error("Failed to fetch chart history", e); }
+        }
+
         function switchTab(tabName) {
             document.getElementById('page-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
             document.getElementById('page-accounts').style.display = tabName === 'accounts' ? 'block' : 'none';
@@ -625,7 +662,6 @@ function getHtml() {
             if(confirm('Reset Ad revenue tracking to current balance?')) {
                 await fetch('/api/reset', { method: 'POST' });
                 chartData = [];
-                localStorage.removeItem('revenue_pct_chart_data_' + currentCurrency);
                 if (revenueChart) {
                     revenueChart.data.labels = [];
                     revenueChart.data.datasets[0].data = [];
@@ -638,13 +674,8 @@ function getHtml() {
             currentCurrency = newCoin;
             document.getElementById('status-text').innerText = 'Fetching Ad data...';
             document.getElementById('total').innerText = '...';
-            
-            chartData = JSON.parse(localStorage.getItem('revenue_pct_chart_data_' + currentCurrency) || '[]');
-            if (revenueChart) {
-                revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
-                revenueChart.data.datasets[0].data = chartData.map(d => d.value);
-                revenueChart.update();
-            }
+            chartData = [];
+            fetchChartHistory(); // Load DB history for new coin
         }
         
         const fmt = (n) => {
@@ -736,25 +767,18 @@ function getHtml() {
                         document.getElementById('adCpc').innerText = fmt(cpc);
                         document.getElementById('adCtr').innerText = Number(ctr).toFixed(2) + '%';
 
-                        // NEW: Update Estimates based on True Growth per Time
                         updateVal('estDay', c.growthPerDay, false, true);
                         updateVal('estMonth', c.growthPerMonth, false, true);
                         updateVal('estYear', c.growthPerYear, false, true);
 
-                        // Pass 'thisMonth' so we can divide it
                         renderTable(data.accounts, c.currency, thisMonth);
 
                         const nowTime = Date.now();
-                        // Add data point if empty or if 60 seconds have passed since last point
+                        // Append to local chart array if 60 seconds passed
                         if (chartData.length === 0 || (nowTime - chartData[chartData.length - 1].time) >= 60000) {
-                            // Pushing the PERCENTAGE (c.growthPct) to the chart
                             chartData.push({ time: nowTime, value: c.growthPct });
-                            
-                            // Keep only the last 10 hours (10 * 60 * 60 * 1000 ms)
                             const tenHoursAgo = nowTime - 36000000;
                             chartData = chartData.filter(d => d.time >= tenHoursAgo);
-                            
-                            localStorage.setItem('revenue_pct_chart_data_' + currentCurrency, JSON.stringify(chartData));
                             
                             if (revenueChart) {
                                 revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
@@ -773,7 +797,6 @@ function getHtml() {
             }
         }
 
-        // Send new domain name to Database API
         async function editDomainName(originalName, currentDomain) {
             let newDomain = prompt("Edit Site (Account Domain):", currentDomain);
             if (newDomain !== null && newDomain.trim() !== "" && newDomain !== currentDomain) {
@@ -793,7 +816,6 @@ function getHtml() {
             const tbody = document.getElementById('accBody');
             tbody.innerHTML = '';
             
-            // Divide Total Ad Revenue among all accounts evenly
             let dividedUnpaidRevenue = accounts.length > 0 ? (thisMonth / accounts.length) : 0;
 
             accounts.forEach(acc => {
@@ -820,6 +842,7 @@ function getHtml() {
         }
 
         initChart();
+        fetchChartHistory(); // Load initial history from database
         pollData();
     </script>
 </body>
