@@ -481,7 +481,7 @@ function getHtml() {
             <!-- CHART CARD -->
             <div class="card" style="margin-bottom: 24px;">
                 <div class="card-header">
-                    <h3 class="card-title">Ad revenue over time (Last 10 Hours)</h3>
+                    <h3 class="card-title">Ad revenue growth over time (Last 10 Hours)</h3>
                     <span class="material-symbols-outlined card-icon">more_vert</span>
                 </div>
                 <div style="position: relative; height: 280px; width: 100%;">
@@ -574,7 +574,7 @@ function getHtml() {
     <script>
         let currentCurrency = 'USDT';
         let revenueChart;
-        let chartData = JSON.parse(localStorage.getItem('revenue_chart_data_' + currentCurrency) || '[]');
+        let chartData = JSON.parse(localStorage.getItem('revenue_pct_chart_data_' + currentCurrency) || '[]');
 
         function initChart() {
             const ctx = document.getElementById('revenueChart').getContext('2d');
@@ -583,7 +583,7 @@ function getHtml() {
                 data: {
                     labels: chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})),
                     datasets: [{
-                        label: 'Total Ad Revenue',
+                        label: 'Revenue Growth (%)',
                         data: chartData.map(d => d.value),
                         borderColor: '#1a73e8',
                         backgroundColor: 'rgba(26, 115, 232, 0.1)',
@@ -599,12 +599,12 @@ function getHtml() {
                     maintainAspectRatio: false,
                     plugins: { 
                         legend: { display: false },
-                        tooltip: { callbacks: { label: function(context) { return '$' + context.parsed.y.toFixed(2); } } } 
+                        tooltip: { callbacks: { label: function(context) { return (context.parsed.y > 0 ? '+' : '') + context.parsed.y.toFixed(4) + '%'; } } } 
                     },
                     scales: {
                         x: { grid: { display: false } },
                         y: { 
-                            ticks: { callback: function(value) { return '$' + value.toFixed(2); } },
+                            ticks: { callback: function(value) { return value.toFixed(4) + '%'; } },
                             grid: { borderDash: [4, 4] }
                         }
                     },
@@ -625,7 +625,7 @@ function getHtml() {
             if(confirm('Reset Ad revenue tracking to current balance?')) {
                 await fetch('/api/reset', { method: 'POST' });
                 chartData = [];
-                localStorage.removeItem('revenue_chart_data_' + currentCurrency);
+                localStorage.removeItem('revenue_pct_chart_data_' + currentCurrency);
                 if (revenueChart) {
                     revenueChart.data.labels = [];
                     revenueChart.data.datasets[0].data = [];
@@ -639,7 +639,7 @@ function getHtml() {
             document.getElementById('status-text').innerText = 'Fetching Ad data...';
             document.getElementById('total').innerText = '...';
             
-            chartData = JSON.parse(localStorage.getItem('revenue_chart_data_' + currentCurrency) || '[]');
+            chartData = JSON.parse(localStorage.getItem('revenue_pct_chart_data_' + currentCurrency) || '[]');
             if (revenueChart) {
                 revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
                 revenueChart.data.datasets[0].data = chartData.map(d => d.value);
@@ -747,13 +747,14 @@ function getHtml() {
                         const nowTime = Date.now();
                         // Add data point if empty or if 60 seconds have passed since last point
                         if (chartData.length === 0 || (nowTime - chartData[chartData.length - 1].time) >= 60000) {
-                            chartData.push({ time: nowTime, value: todaySoFar });
+                            // Pushing the PERCENTAGE (c.growthPct) to the chart
+                            chartData.push({ time: nowTime, value: c.growthPct });
                             
                             // Keep only the last 10 hours (10 * 60 * 60 * 1000 ms)
                             const tenHoursAgo = nowTime - 36000000;
                             chartData = chartData.filter(d => d.time >= tenHoursAgo);
                             
-                            localStorage.setItem('revenue_chart_data_' + currentCurrency, JSON.stringify(chartData));
+                            localStorage.setItem('revenue_pct_chart_data_' + currentCurrency, JSON.stringify(chartData));
                             
                             if (revenueChart) {
                                 revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
