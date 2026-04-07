@@ -315,6 +315,7 @@ function getHtml() {
     <title>Google AdSense</title>
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --google-blue: #1a73e8;
@@ -477,6 +478,17 @@ function getHtml() {
                 </div>
             </div>
 
+            <!-- CHART CARD -->
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="card-header">
+                    <h3 class="card-title">Ad revenue over time (Last 10 Hours)</h3>
+                    <span class="material-symbols-outlined card-icon">more_vert</span>
+                </div>
+                <div style="position: relative; height: 280px; width: 100%;">
+                    <canvas id="revenueChart"></canvas>
+                </div>
+            </div>
+
             <div class="grid">
                 <!-- Performance Card -->
                 <div class="card" style="grid-column: span 2;">
@@ -561,6 +573,45 @@ function getHtml() {
 
     <script>
         let currentCurrency = 'USDT';
+        let revenueChart;
+        let chartData = JSON.parse(localStorage.getItem('revenue_chart_data_' + currentCurrency) || '[]');
+
+        function initChart() {
+            const ctx = document.getElementById('revenueChart').getContext('2d');
+            revenueChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})),
+                    datasets: [{
+                        label: 'Total Ad Revenue',
+                        data: chartData.map(d => d.value),
+                        borderColor: '#1a73e8',
+                        backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { 
+                        legend: { display: false },
+                        tooltip: { callbacks: { label: function(context) { return '$' + context.parsed.y.toFixed(2); } } } 
+                    },
+                    scales: {
+                        x: { grid: { display: false } },
+                        y: { 
+                            ticks: { callback: function(value) { return '$' + value.toFixed(2); } },
+                            grid: { borderDash: [4, 4] }
+                        }
+                    },
+                    interaction: { intersect: false, mode: 'index' }
+                }
+            });
+        }
 
         function switchTab(tabName) {
             document.getElementById('page-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
@@ -573,6 +624,13 @@ function getHtml() {
         async function resetSession() { 
             if(confirm('Reset Ad revenue tracking to current balance?')) {
                 await fetch('/api/reset', { method: 'POST' });
+                chartData = [];
+                localStorage.removeItem('revenue_chart_data_' + currentCurrency);
+                if (revenueChart) {
+                    revenueChart.data.labels = [];
+                    revenueChart.data.datasets[0].data = [];
+                    revenueChart.update();
+                }
             }
         }
         
@@ -580,6 +638,13 @@ function getHtml() {
             currentCurrency = newCoin;
             document.getElementById('status-text').innerText = 'Fetching Ad data...';
             document.getElementById('total').innerText = '...';
+            
+            chartData = JSON.parse(localStorage.getItem('revenue_chart_data_' + currentCurrency) || '[]');
+            if (revenueChart) {
+                revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
+                revenueChart.data.datasets[0].data = chartData.map(d => d.value);
+                revenueChart.update();
+            }
         }
         
         const fmt = (n) => {
@@ -678,6 +743,24 @@ function getHtml() {
 
                         // Pass 'thisMonth' so we can divide it
                         renderTable(data.accounts, c.currency, thisMonth);
+
+                        const nowTime = Date.now();
+                        // Add data point if empty or if 60 seconds have passed since last point
+                        if (chartData.length === 0 || (nowTime - chartData[chartData.length - 1].time) >= 60000) {
+                            chartData.push({ time: nowTime, value: todaySoFar });
+                            
+                            // Keep only the last 10 hours (10 * 60 * 60 * 1000 ms)
+                            const tenHoursAgo = nowTime - 36000000;
+                            chartData = chartData.filter(d => d.time >= tenHoursAgo);
+                            
+                            localStorage.setItem('revenue_chart_data_' + currentCurrency, JSON.stringify(chartData));
+                            
+                            if (revenueChart) {
+                                revenueChart.data.labels = chartData.map(d => new Date(d.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
+                                revenueChart.data.datasets[0].data = chartData.map(d => d.value);
+                                revenueChart.update();
+                            }
+                        }
                     }
                 }
             } catch(err) {
@@ -735,6 +818,7 @@ function getHtml() {
             });
         }
 
+        initChart();
         pollData();
     </script>
 </body>
